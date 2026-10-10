@@ -67,7 +67,8 @@ RUN WILDCARD_DIR="/opt/comfyui-baked/custom_nodes/ComfyUI-TagForge/wildcards" &&
               pmp/blwjob.yaml pmp/prmpt.yaml pmp/qwen21.yaml \
               pmp/prmpt/acc.yaml pmp/prmpt/char.yaml pmp/prmpt/clths.yaml pmp/prmpt/exprss.yaml \
               pmp/prmpt/hair.yaml pmp/prmpt/imgcmp.yaml pmp/prmpt/lctns.yaml pmp/prmpt/light.yaml pmp/prmpt/lens.yaml \
-              pmp/prmpt/pose.yaml pmp/prmpt/styles.yaml pmp/prmpt/dynmc.yaml vid/act.yaml; do \
+              pmp/prmpt/pose.yaml pmp/prmpt/styles.yaml pmp/prmpt/dynmc.yaml \
+              mmh3/camera.yaml mmh3/music.yaml mmh3/nsfw.yaml mmh3/style.yaml mmh3/vfx.yaml; do \
         mkdir -p "$WILDCARD_DIR/$(dirname "$wf")" && \
         wget -q --tries=3 --timeout=30 "$WILDCARD_BASE/$wf" -O "$WILDCARD_DIR/$wf" || \
         echo "⚠️ wildcard $wf download failed"; \
