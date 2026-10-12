@@ -293,12 +293,20 @@ def _patch(prompt, job):
              if "LoadVideo" in n.get("class_type", "")
              and n.get("inputs", {}).get("video") != video_name]
     if dead:
-        for nid in dead:
-            del prompt[nid]
-        for n in prompt.values():
-            for k in [k for k, v in n.get("inputs", {}).items()
-                      if isinstance(v, list) and v and v[0] in dead]:
-                del n["inputs"][k]
+        while dead:
+            for nid in dead:
+                del prompt[nid]
+            emptied = []
+            for nid, n in prompt.items():
+                for k in [k for k, v in n.get("inputs", {}).items()
+                          if isinstance(v, list) and v and v[0] in dead]:
+                    del n["inputs"][k]
+                if not n["inputs"]:
+                    emptied.append(nid)
+            # Cascade: nodes left with zero inputs after unlinking (e.g. a
+            # PixaromaImageInfo whose only input was a dropped loader) would
+            # fail validation on required inputs — drop them too.
+            dead = emptied
     if drop_lora is not None:
         # Rewire the dropped style LoRA's consumers to its model source.
         src = prompt[drop_lora].get("inputs", {}).get("model")
