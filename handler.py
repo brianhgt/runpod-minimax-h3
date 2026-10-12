@@ -191,9 +191,9 @@ def _patch(prompt, job):
                 img_idx += 1
         elif "LoadVideo" in ct and video_name:
             inp["video"] = video_name
-        if job.get("prompt") and "prompt" in inp and not isinstance(inp["prompt"], list):
+        if job.get("prompt") is not None and "prompt" in inp and not isinstance(inp["prompt"], list):
             inp["prompt"] = job["prompt"]
-        if job.get("prompt") and ct == "WildcardProcessor":
+        if job.get("prompt") is not None and ct == "WildcardProcessor":
             inp["text"] = job["prompt"]
             inp["populated_text"] = job["prompt"]
         if job.get("camera_tag") and "camera_tag" in inp:

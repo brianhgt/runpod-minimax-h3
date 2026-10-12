@@ -456,7 +456,7 @@
       "model_name": "GGUF: Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-Q6_K.gguf",
       "preset_prompt": "MiniMax \u203a NSFW R2VA",
       "camera_tag": "None",
-      "prompt": "(S1) E l'immagine stampata \\ cucita su un cuscino su un divano, in un soggiorno moderno\n(S2) \u00e8 una character sheet di Jinx\n(S3) \u00e8 un character sheet di Tifa Lockhart\nLa scena inizia con la porta dell'appartamento che si apre e la camera focussed sulla manila. La camera si allontana ed entrano (S2) e (S3), ma non si vedono per intero, l'inquadratura \u00e8 stretta, si vede la mano che apre la porta e poi i due visi che si guardano e sorridono. si sentono i loro passi. la camera punta in basso sulle ombre delle due ragazze che ora si abbracciano e si baciano, ma noi vediamo solo le ombre. (S3) spinge (S2) sul divano, nel farlo colpisce la camera che cade a terra. Ora la camera \u00e8 a terra, un po' storta, e vediamo (S2) ed (S3) sul divano che si baciano e si toccano. (S2) prende il cuscino (S1) e lo lancia. (S1) finisce sulla camera che si ruota a destra per il colpa e ora inquadra il cuscino a terra e si vede chiaramente l'immagine. Una voce maschile fuori campo dice [D]Singularty. One model to rule them all.[/D]. Fade to black e fine. ",
+      "prompt": "",
       "max_tokens": 8192,
       "keep_model_loaded": false,
       "seed": 3227859527,
