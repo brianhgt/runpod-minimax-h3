@@ -195,8 +195,120 @@ def _load_workflow(name):
     return wf
 
 
+def _comfy_route(path, payload, timeout=300):
+    """POST to a ComfyUI HTTP route and return the JSON body, or {} on any failure.
+
+    Used for the Director's QwenVL routes (analyze/enhance) — they run inside the
+    ComfyUI process this handler booted, so localhost is all it takes. A route that
+    is missing (older image without the Director node) degrades to {} and the
+    caller falls back to the raw text.
+    """
+    try:
+        return json.loads(_http(path, payload, timeout=timeout))
+    except Exception as exc:
+        print(f"[handler] {path} failed: {exc}", flush=True)
+        return {}
+
+
+def _director_timeline(job):
+    """Build the Director's timeline_data from the ForgeHub form, or None.
+
+    The form gives the charsheet (images[0]), the segment ideas one per line in
+    `prompt`, an optional style prose in `global_prompt`, and `seconds` split evenly
+    across the ideas. The subject description comes from the form or is auto-generated
+    by the Analyze route; each idea is then expanded by the Enhance route — the same
+    built-in QwenVL the canvas buttons use — when `enhance` is on (default).
+
+    The charsheet travels INSIDE the timeline (subjects[0].images as b64) — the
+    Director's API graph has no LoadImage; that is how load_ref_image_tensors reads it.
+    """
+    ideas = [l.strip() for l in str(job.get("prompt") or "").splitlines() if l.strip()]
+    if not ideas:
+        return None
+
+    char_b64 = ""
+    images = job.get("images") or []
+    if images:
+        raw = _media_bytes(images[0])
+        if raw:
+            char_b64 = base64.b64encode(raw).decode()
+
+    seconds = int(job.get("seconds") or 10)
+    per = max(1, round(seconds / len(ideas)))
+
+    subject_desc = (job.get("subject_description") or "").strip()
+    retention = ""
+    if not subject_desc and char_b64:
+        res = _comfy_route("/minimax_director/analyze_character", {
+            "image_b64": char_b64, "char_index": 0, "kind": "person",
+            "provider": "qwenvl", "base_url": "", "model": "",
+        })
+        if res.get("status") == "success":
+            subject_desc = res.get("description") or ""
+            retention = res.get("retention_note") or ""
+
+    fps = 24
+    segments = []
+    cursor = 0
+    for idea in ideas:
+        text = idea
+        if job.get("enhance", True) and char_b64:
+            res = _comfy_route("/minimax_director/enhance_segment", {
+                "image_b64": char_b64, "segment_text": idea,
+                "global_prompt": job.get("global_prompt") or "",
+                "provider": "qwenvl", "base_url": "", "model": "",
+            })
+            if res.get("status") == "success" and (res.get("text") or "").strip():
+                text = res["text"].strip()
+        segments.append({
+            "id": uuid.uuid4().hex, "start": cursor * fps, "length": per * fps,
+            "prompt": text, "type": "text", "isEndFrame": False,
+        })
+        cursor += per
+
+    total = cursor * fps
+    tdata = {
+        "mainTrackEnabled": True, "audioTrackEnabled": True, "motionTrackEnabled": True,
+        "propHeight": 90, "globalPropHeight": 126,
+        "showFilenames": False, "showPromptZones": True,
+        "overrideAudio": False, "inpaint_audio": True,
+        "global_prompt": job.get("global_prompt") or "",
+        "retake_global_prompt": "",
+        "overall_soundscape": job.get("overall_soundscape") or "",
+        "non_diegetic_music": job.get("non_diegetic_music") or "",
+        "prompt_override": "", "prompt_override_on": False,
+        "retakeMode": False, "retakeStart": 0, "retakeLength": 0,
+        "retakePrompt": "", "retakeStrength": 1, "retakeVideo": None,
+        "normalStartFrame": 0, "normalDurationFrames": total,
+        "reference_mode": "REF2VA", "prompt_format": "minimax",
+        "analyzeProvider": "qwenvl", "analyzeBaseUrl": "", "analyzeModel": "",
+        "summary": job.get("summary") or "", "task_type_override": "",
+        "subjectSlotCount": 1,
+        "subjects": [{
+            "description": subject_desc, "retentionNote": retention,
+            "images": ([{"b64": char_b64}] if char_b64 else []),
+        }],
+        "segments": segments, "motionSegments": [], "audioSegments": [],
+    }
+    return json.dumps(tdata), total
+
+
 def _patch(prompt, job):
-    cfg = MINIMAX_CONFIGS.get(job.get("config"))
+    director_nodes = [n for n in prompt.values()
+                      if n.get("class_type") == "MiniMaxH3DirectorCS"]
+    # Two Director flows: Native (the timeline owns the text — build it from the
+    # form) and Storyboard (the in-graph QwenVL feeds external_prompt and the refs
+    # ride the ref_images socket — the existing heuristics cover it; only the
+    # window follows `seconds`). Injecting a timeline into the Storyboard would
+    # double the references (subject b64 + socket), so it gets window-only.
+    native_director = any(
+        not isinstance(n.get("inputs", {}).get("external_prompt"), list)
+        for n in director_nodes)
+    director = _director_timeline(job) if native_director else None
+    director_tdata, director_total = director if director else (None, 0)
+    # The Director graphs carry their own two unets; the config preset's unet
+    # needle would rewrite both to one model — skip it entirely there.
+    cfg = None if director_nodes else MINIMAX_CONFIGS.get(job.get("config"))
     base = re.sub(r"[^\w.-]+", "-", str(job.get("job_name") or f"job_{uuid.uuid4().hex[:8]}")).strip("-")
     images = [_upload(f"{base}_{i}.png", _media_bytes(v)) for i, v in enumerate(job.get("images") or [])]
     video_name = None
@@ -236,20 +348,35 @@ def _patch(prompt, job):
                 img_idx += 1
         elif "LoadVideo" in ct and video_name:
             inp["video"] = video_name
-        if job.get("prompt") is not None and "prompt" in inp and not isinstance(inp["prompt"], list):
+        if ct == "MiniMaxH3DirectorCS" and director_nodes:
+            # Native: inject the form-built timeline. Storyboard: leave the baked
+            # one (its refs come from the socket). Either way the window follows
+            # the timeline's total, or `seconds` when no timeline was built.
+            if director_tdata is not None:
+                inp["timeline_data"] = director_tdata
+            total = director_total or (int(job["seconds"]) * 24 if job.get("seconds") else 0)
+            if total:
+                for wkey, val in (("start_frame", 0), ("end_frame", total),
+                                  ("duration_frames", total),
+                                  ("start_second", 0), ("duration_seconds", total / 24)):
+                    if wkey in inp:
+                        inp[wkey] = val
+            if director_tdata is not None:
+                continue
+        if director_tdata is None and job.get("prompt") is not None and "prompt" in inp and not isinstance(inp["prompt"], list):
             inp["prompt"] = job["prompt"]
-        if job.get("prompt") is not None and ct == "WildcardProcessor":
+        if director_tdata is None and job.get("prompt") is not None and ct == "WildcardProcessor":
             inp["text"] = job["prompt"]
             inp["populated_text"] = job["prompt"]
-        if job.get("camera_tag") and "camera_tag" in inp:
+        if director_tdata is None and job.get("camera_tag") and "camera_tag" in inp:
             inp["camera_tag"] = job["camera_tag"]
-        if job.get("vl_preset"):
+        if director_tdata is None and job.get("vl_preset"):
             for wkey in ("preset_prompt", "enhancement_style"):
                 if wkey in inp:
                     inp[wkey] = job["vl_preset"]
-        if job.get("enhance") is False and "passthrough" in inp:
+        if director_tdata is None and job.get("enhance") is False and "passthrough" in inp:
             inp["passthrough"] = True
-        if job.get("seconds"):
+        if director_tdata is None and job.get("seconds"):
             sec = int(job["seconds"])
             if "duration" in inp:
                 inp["duration"] = f"{sec}s"
