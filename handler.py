@@ -572,6 +572,12 @@ def _patch(prompt, job):
             elif ct == "MiniMaxH3DirectorCS":
                 # the Director's own canvas: custom_width/height are its size widgets
                 inp["custom_width"], inp["custom_height"] = w, h
+            elif ct == "ComfyUI-PerfectVideoResolution":
+                # explicit size beats the tier labels: _parse_resolution falls
+                # through to _parse_size for a "WxH" value. use_image_aspect off —
+                # a picked size is literal; "auto" never reaches this branch.
+                inp["resolution"] = f"{w}x{h}"
+                inp["use_image_aspect"] = False
     # Explicit encoder resolution (job["resolution"]) overrides the
     # image_size-derived value on the PixaromaDropdown / direct int input.
     res_override = job.get("resolution")
