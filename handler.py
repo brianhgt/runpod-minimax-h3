@@ -586,11 +586,6 @@ def _patch(prompt, job):
                 # a picked size is literal; "auto" never reaches this branch.
                 inp["resolution"] = f"{w}x{h}"
                 inp["use_image_aspect"] = False
-            elif ct == "easy fullLoader" and "resolution" in inp:
-                # the Pony loader's resolution combo takes the space-separated
-                # SDXL bucket strings; the latent widgets carry the same numbers
-                inp["resolution"] = f"{w} x {h}"
-                inp["empty_latent_width"], inp["empty_latent_height"] = w, h
     # Explicit encoder resolution (job["resolution"]) overrides the
     # image_size-derived value on the PixaromaDropdown / direct int input.
     res_override = job.get("resolution")
