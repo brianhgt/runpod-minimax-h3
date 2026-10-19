@@ -526,7 +526,15 @@ def _patch(prompt, job):
         res = prompt[nid].get("inputs", {}).get("resolution")
         if isinstance(res, list) and res and str(res[0]) in prompt:
             dropdown_ids.add(str(res[0]))
-    m = re.match(r"(\d+)\s*x\s*(\d+)", str(job.get("image_size") or ""))
+    image_size_raw = str(job.get("image_size") or "")
+    if image_size_raw.strip().lower().startswith("auto"):
+        # "auto": the PVR keeps its baked behavior (use_image_aspect drives it);
+        # the Director's canvas derives from the first timeline image (0x0).
+        for node in prompt.values():
+            if node.get("class_type") == "MiniMaxH3DirectorCS":
+                inp = node.setdefault("inputs", {})
+                inp["custom_width"], inp["custom_height"] = 0, 0
+    m = re.match(r"(\d+)\s*x\s*(\d+)", image_size_raw)
     if m:
         w, h = int(m.group(1)), int(m.group(2))
         for nid, node in prompt.items():
