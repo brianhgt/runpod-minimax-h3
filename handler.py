@@ -502,7 +502,10 @@ def _patch(prompt, job):
         rife["inputs"]["frames"] = upscaler["inputs"]["images"]
     if not job.get("rife", True) and rife is not None and saver is not None:
         saver["inputs"]["images"] = rife["inputs"]["frames"]
-        if "frame_rate" in saver["inputs"]:
+        # The VHS saver bakes 48 (the RIFE'd rate) — halve it. The Director's
+        # CreateVideo takes fps as a LINK from the Director's own frame_rate
+        # output, which is already the pre-RIFE rate: leave it alone.
+        if "frame_rate" in saver["inputs"] and not isinstance(saver["inputs"]["frame_rate"], list):
             saver["inputs"]["frame_rate"] = saver["inputs"]["frame_rate"] // int(rife["inputs"].get("multiplier", 2) or 2)
     # Upscaler model / target overrides — the loader node feeds "upscaler_trt_model".
     upscaler_loader = next((n for n in prompt.values()
