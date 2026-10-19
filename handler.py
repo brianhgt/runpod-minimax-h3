@@ -569,6 +569,9 @@ def _patch(prompt, job):
                     inp["DropdownState"] = json.dumps(state)
             elif ct.startswith("TextEncodeQwenImage21") and isinstance(inp.get("resolution"), int):
                 inp["resolution"] = max(w, h)
+            elif ct == "MiniMaxH3DirectorCS":
+                # the Director's own canvas: custom_width/height are its size widgets
+                inp["custom_width"], inp["custom_height"] = w, h
     # Explicit encoder resolution (job["resolution"]) overrides the
     # image_size-derived value on the PixaromaDropdown / direct int input.
     res_override = job.get("resolution")
