@@ -233,6 +233,14 @@ def _director_timeline(job):
         if raw:
             char_b64 = base64.b64encode(raw).decode()
 
+    # The form's Video style dropdown rides as its own job field: the option's
+    # "[TAG] - " prefix strips off the same way the prompt-prepend path does,
+    # and the resolved style text opens the global prompt — the enhance's style
+    # context and the compiled prompt's first lines carry it.
+    style_raw = str(job.get("style") or "").strip()
+    style_text = re.sub(r"^\[[^\]]*\]\s*-\s*", "", style_raw) if style_raw and style_raw != "None" else ""
+    global_prompt = "\n".join(x for x in (style_text, str(job.get("global_prompt") or "")) if x.strip())
+
     seconds = int(job.get("seconds") or 10)
     per = max(1, round(seconds / len(ideas)))
 
@@ -255,7 +263,7 @@ def _director_timeline(job):
         if job.get("enhance", True) and char_b64:
             res = _comfy_route("/minimax_director/enhance_segment", {
                 "image_b64": char_b64, "segment_text": idea,
-                "global_prompt": job.get("global_prompt") or "",
+                "global_prompt": global_prompt,
                 "provider": "qwenvl", "base_url": "", "model": "",
             })
             if res.get("status") == "success" and (res.get("text") or "").strip():
@@ -274,7 +282,7 @@ def _director_timeline(job):
         "propHeight": 90, "globalPropHeight": 126,
         "showFilenames": False, "showPromptZones": True,
         "overrideAudio": False, "inpaint_audio": True,
-        "global_prompt": job.get("global_prompt") or "",
+        "global_prompt": global_prompt,
         "retake_global_prompt": "",
         "overall_soundscape": job.get("overall_soundscape") or "",
         "non_diegetic_music": job.get("non_diegetic_music") or "",
