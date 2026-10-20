@@ -267,6 +267,8 @@ def _director_timeline(job):
         cursor += per
 
     total = cursor * fps
+    ref_raw = str(job.get("reference_mode") or "REF2VA")
+    ref_mode = "OFF" if ref_raw.strip().lower().startswith("off") else "REF2VA"
     tdata = {
         "mainTrackEnabled": True, "audioTrackEnabled": True, "motionTrackEnabled": True,
         "propHeight": 90, "globalPropHeight": 126,
@@ -280,7 +282,7 @@ def _director_timeline(job):
         "retakeMode": False, "retakeStart": 0, "retakeLength": 0,
         "retakePrompt": "", "retakeStrength": 1, "retakeVideo": None,
         "normalStartFrame": 0, "normalDurationFrames": total,
-        "reference_mode": "REF2VA", "prompt_format": "minimax",
+        "reference_mode": ref_mode, "prompt_format": "minimax",
         "analyzeProvider": "qwenvl", "analyzeBaseUrl": "", "analyzeModel": "",
         "summary": job.get("summary") or "", "task_type_override": "",
         "subjectSlotCount": 1,
