@@ -307,8 +307,11 @@ def _patch(prompt, job):
     director = _director_timeline(job) if native_director else None
     director_tdata, director_total = director if director else (None, 0)
     # The Director graphs carry their own two unets; the config preset's unet
-    # needle would rewrite both to one model — skip it entirely there.
-    cfg = None if director_nodes else MINIMAX_CONFIGS.get(job.get("config"))
+    # needle would rewrite both to one model — keep the preset's sampler/LoRA
+    # parts but blind the needle.
+    cfg = MINIMAX_CONFIGS.get(job.get("config"))
+    if director_nodes and cfg:
+        cfg = {**cfg, "unet": None}
     base = re.sub(r"[^\w.-]+", "-", str(job.get("job_name") or f"job_{uuid.uuid4().hex[:8]}")).strip("-")
     images = [_upload(f"{base}_{i}.png", _media_bytes(v)) for i, v in enumerate(job.get("images") or [])]
     video_name = None
@@ -414,7 +417,7 @@ def _patch(prompt, job):
                     for skey in ("strength_model", "strength_clip"):
                         if skey in inp:
                             inp[skey] = 0.0
-        elif cfg is not None and "unet_name" in inp:  # MiniMax H3 generator/enhancer node
+        elif cfg is not None and cfg.get("unet") and "unet_name" in inp:  # MiniMax H3 generator/enhancer node
             needle = cfg["unet"]
             if needle.lower() not in str(inp.get("unet_name", "")).lower():
                 found = _find_file("unet", needle) or _find_file("diffusion_models", needle)
