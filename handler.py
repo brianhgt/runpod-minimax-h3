@@ -210,6 +210,13 @@ def _comfy_route(path, payload, timeout=300):
         return {}
 
 
+def _job_style_text(job):
+    """The form's Video style option rides as a job field: the "[TAG] - " prefix
+    strips off the same way the prompt-prepend path does."""
+    style_raw = str(job.get("style") or "").strip()
+    return re.sub(r"^\[[^\]]*\]\s*-\s*", "", style_raw) if style_raw and style_raw != "None" else ""
+
+
 def _director_timeline(job):
     """Build the Director's timeline_data from the ForgeHub form, or None.
 
@@ -233,13 +240,9 @@ def _director_timeline(job):
         if raw:
             char_b64 = base64.b64encode(raw).decode()
 
-    # The form's Video style dropdown rides as its own job field: the option's
-    # "[TAG] - " prefix strips off the same way the prompt-prepend path does,
-    # and the resolved style text opens the global prompt — the enhance's style
+    # The resolved style text opens the global prompt — the enhance's style
     # context and the compiled prompt's first lines carry it.
-    style_raw = str(job.get("style") or "").strip()
-    style_text = re.sub(r"^\[[^\]]*\]\s*-\s*", "", style_raw) if style_raw and style_raw != "None" else ""
-    global_prompt = "\n".join(x for x in (style_text, str(job.get("global_prompt") or "")) if x.strip())
+    global_prompt = "\n".join(x for x in (_job_style_text(job), str(job.get("global_prompt") or "")) if x.strip())
 
     seconds = int(job.get("seconds") or 10)
     per = max(1, round(seconds / len(ideas)))
@@ -389,6 +392,12 @@ def _patch(prompt, job):
                     inp[wkey] = job["vl_preset"]
         if director_tdata is None and job.get("enhance") is False and "passthrough" in inp:
             inp["passthrough"] = True
+        # Storyboard: the QwenVL feeds external_prompt, so the style directive
+        # cannot ride the global prompt — a StringConcatenate node prepends it
+        # verbatim to the compiled prompt instead of letting the VLM weave it in.
+        if director_nodes and director_tdata is None and ct == "StringConcatenate" \
+                and "string_a" in inp and not isinstance(inp["string_a"], list):
+            inp["string_a"] = _job_style_text(job)
         if director_tdata is None and job.get("seconds"):
             sec = int(job["seconds"])
             if "duration" in inp:
