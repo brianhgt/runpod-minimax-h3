@@ -4,22 +4,13 @@
 
 [![Runpod](https://api.runpod.io/badge/huchukato/runpod-minimax-h3)](https://console.runpod.io/hub)
 
-A production-ready [Runpod Serverless](https://docs.runpod.io/serverless/overview) worker running **MiniMax H3** (Comfy-Org INT8 ConvRot) on ComfyUI — text/image/first-last-frame/reference-to-video **with audio**, lightx2v 8-step turbo LoRAs, TensorRT RIFE interpolation + upscaling, wildcard prompts and an uncensored Qwen3-VL enhancer.
-
-Built for [ForgeHub](https://github.com/huchukato/ForgeHub), a desktop + self-hosted frontend that drives these workflows — but the endpoint speaks plain Runpod API, so anything can call it.
+A production-ready [Runpod Serverless](https://docs.runpod.io/serverless/overview) worker running **MiniMax H3** (Comfy-Org INT8 ConvRot) on ComfyUI — text/image/first-last-frame/reference-to-video **with audio**, multi-scene **storyboards via the Director**, turbo LoRAs, TensorRT RIFE + upscaling, wildcards and an uncensored Qwen3-VL enhancer. Built for [ForgeHub](https://github.com/huchukato/ForgeHub), but the endpoint speaks plain Runpod API.
 
 ## Deploy
 
-1. **Storage first**: create a [network volume](https://console.runpod.io/user/storage) (≥160GB) in a datacenter with 96GB Pro GPUs — e.g. `US-NE-1`. Name it whatever you like.
-2. Click **Deploy** on this listing — it creates a Serverless endpoint.
-3. Open the endpoint → **Edit** → set **Max workers ≥ 1** (0 means it never scales) and under **Advanced → Network volumes** select your volume. Save — workers restart and auto-download ~100GB of models on first boot (cold start is long, once).
-4. Done — call it via the Runpod API or ForgeHub below.
-
-> No volume attached? Workers boot but every job fails on missing models — the volume is where the models live.
-
-## Get the app
-
-Deployed the endpoint? Drive it with ForgeHub — workflows, wildcard browsing, job queue and outputs included. Paste your API key and it detects the endpoint by itself.
+1. **Storage first**: create a [network volume](https://console.runpod.io/user/storage) (≥160GB) in a datacenter with 96GB Pro GPUs — e.g. `US-NE-1`.
+2. Click **Deploy** → endpoint → **Edit** → Max workers ≥ 1 + attach your volume. Workers auto-download ~100GB of models on first boot (once). No volume = every job fails on missing models.
+3. Call it via the Runpod API or ForgeHub below — workflows, wildcards, job queue and outputs included; paste your API key and it detects the endpoint by itself.
 
 [![Download ForgeHub](https://raw.githubusercontent.com/huchukato/runpod-minimax-h3/main/media/forgehub-release.jpeg)](https://github.com/huchukato/ForgeHub/releases/latest)
 
@@ -31,50 +22,51 @@ Deployed the endpoint? Drive it with ForgeHub — workflows, wildcard browsing, 
 | `MiniMaxH3-Turbo-I2VA.json` | Image → video + audio |
 | `MiniMaxH3-Turbo-FL2VA.json` | First/last frame → video + audio |
 | `MiniMaxH3-Turbo-R2VA.json` | Reference images → video + audio |
-| `MiniMaxH3-Singularity-R2VA.json` | Singularity fusion — up to 3 ref images + ref video → video + audio |
+| `MiniMaxH3-Singularity-R2VA.json` | Singularity fusion — up to 3 ref images + ref video |
+| `MiniMaxH3-Director-Native.json` | **Director**: character sheet + one idea per line → multi-scene storyboard with audio; the worker auto-analyzes the subject and expands each idea via the built-in QwenVL |
+| `MiniMaxH3-Director-Storyboard.json` | **Director**: one idea (+ up to 3 storyboard frames) → single video; the in-graph QwenVL turns the idea into a full R2VA prompt |
 
 ## Requirements
 
-- **GPU**: 96GB class (`BLACKWELL_96` pool — e.g. B200). The 32B NVFP4 text encoder + video DiTs + TensorRT engines need the headroom.
-- **Network volume**: ≥160GB attached to the endpoint at `/runpod-volume`. Workers auto-download missing models from `models-manifest.txt` (~100GB — first cold start is long; subsequent workers reuse the volume). TensorRT engines also compile once onto the volume. Disable with `VOLUME_AUTOPOPULATE=false` if you manage the volume yourself.
+- **GPU**: 96GB class (`BLACKWELL_96` pool). The 32B text encoder + two video DiTs + TensorRT engines need the headroom.
+- **Network volume**: ≥160GB at `/runpod-volume`. Models auto-download from `models-manifest.txt` (~100GB). Disable with `VOLUME_AUTOPOPULATE=false`.
 - **CUDA**: 13.0+ hosts.
 
 ## Model stack (auto-provisioned)
 
 - DiTs: Comfy-Org `minimax_h3_fl2va` INT8, `Minimax-h3_Singularity_ref2va` INT8 (T2V/I2V/R2V/V2V in one unet)
 - Text encoder: `qwen3vl_32b_heretic_minimax_h3_nvfp4` (Momoking)
-- Turbo LoRAs: lightx2v fl2v/ref2v 8-step
-- Style LoRAs (Singularity `lora` param): `h3-realism-people` (fal), `h3_character_swap` (akatz)
-- VAEs: MiniMax H3 video fp16 + audio fp32, `taeh3` preview VAE
-- Face detailer models: `face_yolov8m` + `sam_vit_b` (Easy-Use/Impact)
-- Enhancer LLM: Qwen3.5-9B Defiant-Fable NEO-MAX Q6_K GGUF + mmproj
+- Turbo LoRAs: lightx2v fl2v/ref2v 8-step · Style LoRAs: `h3-realism-people` (fal), `h3_character_swap` (akatz)
+- VAEs: video fp16 + audio fp32, `taeh3` preview · Face detailer: `face_yolov8m` + `sam_vit_b`
+- Enhancer LLM: Qwen3.5-9B Defiant-Fable NEO-MAX Q6_K GGUF + mmproj (also drives the Director's auto-Analyze/Enhance)
 
 ## Job input
 
 ```json
 {
   "input": {
-    "workflow": "MiniMaxH3-Turbo-FL2VA.json",
-    "prompt": "[DOLLY IN] a __pmp/prmpt/lctns__ rooftop at dusk",
-    "config": "native_turbo",
-    "camera_tag": "[ORBIT]",
-    "seconds": 6,
-    "images": ["https://…", "https://…"],
+    "workflow": "MiniMaxH3-Director-Native.json",
+    "prompt": "she turns from the window, hair catching the golden light\nshe walks toward the camera, playful smile",
+    "global_prompt": "warm cinematic realism; her look stays the same in every shot",
+    "seconds": 10,
+    "images": ["<character sheet>"],
+    "enhance": true,
+    "video_size": "1344x768 (16:9)",
     "upscale": true,
     "rife": true
   }
 }
 ```
 
-- `config` presets: `native` / `native_turbo` / `r2va_singularity` / `r2va_singularity_turbo` / `10eros` / `10eros_turbo` — they swap the DiT needle, turbo LoRA, steps/sampler/scheduler and shift values
-- `lora` — style LoRA on the Singularity recipe: `none` (default) / `realism` / `char_swap`
-- `images` — up to 3 reference images (1 image ≈ I2V behavior); `video` — URL or base64, fills the reference-video loader (R2VA)
-- `upscale` / `rife` — toggle the TensorRT post-processing chain
-- `"action": "health"` — returns `{"status": "ok", "workflows": […], "volume_mounted": bool}` without running a generation
+- **Director Native**: `prompt` = one idea per line (each = a segment, `seconds` split evenly); `global_prompt` = style prose; `subject_description` optional (auto-Analyze when empty); `enhance` = per-segment QwenVL autoprompting (default true)
+- **Director Storyboard**: `prompt` = one idea (timestamps welcome); `images` = up to 3 storyboard frames; `vl_preset` = `MiniMax › Director Storyboard` / `Director Prose`
+- Classic: `config` presets (`native`/`native_turbo`/`r2va_singularity`/`r2va_singularity_turbo`/`10eros`/`10eros_turbo`) swap DiT/LoRA/steps/sampler/shift; `lora` = style LoRA on Singularity (`none`/`realism`/`char_swap`)
+- `video_size` — `auto` (follows the image/stills) or an explicit MMH3 native preset (`1344x768 (16:9)`, `1184x864 (4:3)`, …)
+- `upscale` / `rife` — TensorRT post chain · `"action": "health"` — status + workflow list, no generation
 
 ## Custom nodes baked in
 
-`ComfyUI-VideoHelperSuite` · `ComfyUI-Easy-Use` · `ComfyUI-Impact-Pack` · `ComfyUI-Impact-Subpack` · `ComfyUI-QwenVL-Mod` · `ComfyUI-RIFE-TensorRT-Auto` · `ComfyUI-Upscaler-TensorRT-Auto` · `ComfyUI-TagForge` · `ComfyUI-PerfectVideoResolution` · `ComfyUI-Pixaroma` · `ComfyUI-KJNodes`
+`ComfyUI-VideoHelperSuite` · `ComfyUI-Easy-Use` · `ComfyUI-Impact-Pack` · `ComfyUI-Impact-Subpack` · `ComfyUI-QwenVL-Mod` · `ComfyUI-MiniMaxH3-Director` · `ComfyUI-RIFE-TensorRT-Auto` · `ComfyUI-Upscaler-TensorRT-Auto` · `ComfyUI-TagForge` · `ComfyUI-PerfectVideoResolution` · `ComfyUI-Pixaroma` · `ComfyUI-KJNodes`
 
 ## Companion stack
 
