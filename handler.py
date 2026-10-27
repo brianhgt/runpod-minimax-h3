@@ -86,8 +86,11 @@ def _boot_comfy():
     # int8-convrot Qwen/MMh3 stacks (flat garbage output).
     cmd = [
         "python3", "main.py",
-        "--listen", "127.0.0.1", "--port", "8188",
+        "--listen", "127.0.0.1",
+        "--port", "8188",
         "--disable-auto-launch",
+        "--extra-model-paths-config",
+        str(Path(COMFY_DIR) / "extra_model_paths.yaml"),
     ] + os.environ.get("COMFYUI_EXTRA_ARGS", "").split()
     comfy_log = open("/workspace/comfy.log", "ab", buffering=0)
     proc = subprocess.Popen(cmd, cwd=COMFY_DIR, stdout=comfy_log, stderr=subprocess.STDOUT)
