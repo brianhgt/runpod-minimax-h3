@@ -18,24 +18,34 @@
 .EXAMPLE
   $env:RUNPOD_API_KEY = "..."
   .\h3-serverless.ps1 .\ref2va_01.json
+
+.EXAMPLE
+  # Only print the POST body (e.g. to use with curl); nothing is sent
+  .\h3-serverless.ps1 .\ref2va_01.json -BodyOnly > body.json
+  .\h3-serverless.ps1 .\ref2va_01.json -BodyOnly -BodyFile body.json
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
     [string]$Config,
-    [string]$EndpointId
+    [string]$EndpointId,
+    # Print the POST body (JSON) to the output stream and exit: nothing is submitted, no API key needed.
+    [switch]$BodyOnly,
+    # With -BodyOnly: write the body to this file instead of the output stream.
+    [string]$BodyFile
 )
 
 $ErrorActionPreference = "Stop"
 
-if (-not $env:RUNPOD_API_KEY) { throw "Set the RUNPOD_API_KEY environment variable first." }
+if (-not $BodyOnly -and -not $env:RUNPOD_API_KEY) { throw "Set the RUNPOD_API_KEY environment variable first." }
+if ($BodyFile -and -not $BodyOnly) { throw "-BodyFile requires -BodyOnly." }
 
 $ConfigPath = (Resolve-Path -LiteralPath $Config).Path
 $ConfigDir = Split-Path -Parent $ConfigPath
 $Cfg = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 
 if (-not $EndpointId) { $EndpointId = if ($Cfg.endpointId) { $Cfg.endpointId } else { $env:RUNPOD_ENDPOINT_ID } }
-if (-not $EndpointId) { throw "No endpoint id: set endpointId in the job file, pass -EndpointId, or set RUNPOD_ENDPOINT_ID." }
+if (-not $BodyOnly -and -not $EndpointId) { throw "No endpoint id: set endpointId in the job file, pass -EndpointId, or set RUNPOD_ENDPOINT_ID." }
 if (-not $Cfg.input) { throw "Job file has no 'input' object: $ConfigPath" }
 
 $OutputDir = if ($Cfg.outputDir) { $Cfg.outputDir } else { Join-Path $ConfigDir "output" }
@@ -76,6 +86,18 @@ $Headers = @{
 }
 
 $Payload = @{ input = $Cfg.input } | ConvertTo-Json -Depth 20 -Compress
+
+if ($BodyOnly) {
+    if ($BodyFile) {
+        [System.IO.File]::WriteAllText($BodyFile, $Payload, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host ("Wrote {0:N2} MB body to {1}" -f ($Payload.Length / 1MB), $BodyFile)
+    }
+    else {
+        $Payload
+    }
+    return
+}
+
 Write-Host ("Request body: {0:N2} MB" -f ($Payload.Length / 1MB))
 
 # ---- Submit ----

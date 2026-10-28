@@ -1,5 +1,5 @@
 {
-  "endpointId": "vj5rjg70ppdbky",
+  "endpointId": "nnu0fa8s1yhy18",
   "outputDir": "D:/workspace/imagegen/_ns/_output/runpod/h3_video",
   "timeoutMinutes": 30,
   "input": {
@@ -14,7 +14,7 @@
       },
       "Seed": -1,
       "Reference Image": [
-        "@D:/workspace/imagegen/_ns/Photos-nsfw-002/20260411_224425.jpg"
+        "@D:/workspace/imagegen/_ns/Photos-nsfw-002/20260421_170504.jpg"
       ]
     }
   }
