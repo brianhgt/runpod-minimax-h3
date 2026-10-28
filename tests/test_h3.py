@@ -135,6 +135,20 @@ class ManifestToolsTest(unittest.TestCase):
         args.manifests = [str(ROOT / "models" / "t2va.txt")]
         self.assertTrue(manifest_tools.cmd_workflows(args))
 
+    def test_every_workflow_covered_by_all(self):
+        entries, _ = manifest_tools.load_manifests([ROOT / "models" / "all.txt"])
+        have = {(e.subdir, e.name) for e in entries}
+        for wf in WF.parent.glob("*.json"):
+            for name, subdirs in manifest_tools.workflow_models(wf):
+                self.assertTrue(any((s, name) in have for s in subdirs), f"{wf.name}: {name}")
+
+    def test_subsets_cover_their_workflow(self):
+        for subset, wf in (("ref2va", "video_minimax_h3_r2v.json"), ("i2va", "video_minimax_h3_i2v.json")):
+            entries, _ = manifest_tools.load_manifests([ROOT / "models" / f"{subset}.txt"])
+            have = {(e.subdir, e.name) for e in entries}
+            for name, subdirs in manifest_tools.workflow_models(WF.parent / wf):
+                self.assertTrue(any((s, name) in have for s in subdirs), f"{subset}: {name}")
+
     def test_bad_lines(self):
         sha = "a" * 64
         cases = {

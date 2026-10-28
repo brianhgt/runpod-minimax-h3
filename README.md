@@ -21,6 +21,7 @@ Templates live in [workflows-api/h3/](workflows-api/h3) (ComfyUI API format) and
 | Workflow | Description |
 | --- | --- |
 | `video_minimax_h3_r2v` | Reference images → video + audio (INT8 ref2va, optional 4-step turbo LoRA) |
+| `video_minimax_h3_i2v` | Image → video + audio (INT8 fl2va, optional 8-step turbo LoRA) |
 
 ## Requirements
 
@@ -36,6 +37,7 @@ Templates live in [workflows-api/h3/](workflows-api/h3) (ComfyUI API format) and
 | --- | --- |
 | `all` | Everything (default for auto-provisioning) |
 | `ref2va` | What `video_minimax_h3_r2v` loads |
+| `i2va` | What `video_minimax_h3_i2v` loads |
 | `t2va` | fl2va DiT, Heretic text encoder, fp16 video VAE, turbo + realism LoRAs |
 
 Validation:
