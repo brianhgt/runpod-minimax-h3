@@ -46,11 +46,14 @@ find /usr /opt -name build_sam.py -exec sed -i 's|torch\.load(f)|torch.load(f, w
 # byte size of the known-good HF copy and force a re-download on mismatch.
 [ "$(stat -c%s /runpod-volume/models/sams/sam_vit_b_01ec64.pth 2>/dev/null)" != "375042383" ] && rm -f /runpod-volume/models/sams/sam_vit_b_01ec64.pth
 
-# Auto-populate the network volume on first boot (models-manifest.txt).
+# Auto-populate the network volume on first boot from the named manifests in
+# /opt/serverless/models/ (VOLUME_MANIFESTS, space-separated; default "all").
 # Concurrent cold workers serialize on a flock inside populate-volume.sh;
 # disable with VOLUME_AUTOPOPULATE=false.
 if [ "${VOLUME_AUTOPOPULATE:-true}" = "true" ]; then
-    /opt/serverless/populate-volume.sh || echo "entrypoint: volume populate failed — jobs may error on missing models" >&2
+    manifests=()
+    for m in ${VOLUME_MANIFESTS:-all}; do manifests+=("/opt/serverless/models/$m.txt"); done
+    /opt/serverless/populate-volume.sh "${manifests[@]}" || echo "entrypoint: volume populate failed — jobs may error on missing models" >&2
 fi
 
 # TensorRT engines: the *-TensorRT-Auto nodes compile engines lazily on first

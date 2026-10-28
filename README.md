@@ -16,53 +16,71 @@ A production-ready [Runpod Serverless](https://docs.runpod.io/serverless/overvie
 
 ## Workflows included
 
+Templates live in [workflows-api/h3/](workflows-api/h3) (ComfyUI API format) and are baked into `/opt/workflows`.
+
 | Workflow | Description |
 | --- | --- |
-| `MiniMaxH3-Turbo-T2VA.json` | Text → video + audio |
-| `MiniMaxH3-Turbo-I2VA.json` | Image → video + audio |
-| `MiniMaxH3-Turbo-FL2VA.json` | First/last frame → video + audio |
-| `MiniMaxH3-Turbo-R2VA.json` | Reference images → video + audio |
-| `MiniMaxH3-Singularity-R2VA.json` | Singularity fusion — up to 3 ref images + ref video |
-| `MiniMaxH3-Director-Native.json` | **Director**: character sheet + one idea per line → multi-scene storyboard with audio; the worker auto-analyzes the subject and expands each idea via the built-in QwenVL |
-| `MiniMaxH3-Director-Storyboard.json` | **Director**: one idea (+ up to 3 storyboard frames) → single video; the in-graph QwenVL turns the idea into a full R2VA prompt |
+| `video_minimax_h3_r2v` | Reference images → video + audio (INT8 ref2va, optional 4-step turbo LoRA) |
 
 ## Requirements
 
-- **GPU**: 96GB class (`BLACKWELL_96` pool). The 32B text encoder + two video DiTs + TensorRT engines need the headroom.
-- **Network volume**: ≥160GB at `/runpod-volume`. Models auto-download from `models-manifest.txt` (~100GB). Disable with `VOLUME_AUTOPOPULATE=false`.
+- **GPU**: 96GB class (`BLACKWELL_96` pool). The 32B text encoder + video DiT + TensorRT engines need the headroom.
+- **Network volume**: ≥160GB at `/runpod-volume`. Models auto-download at boot from `models/all.txt` (~100GB); pick a subset with `VOLUME_MANIFESTS="ref2va"`. Disable with `VOLUME_AUTOPOPULATE=false`.
 - **CUDA**: 13.0+ hosts.
 
-## Model stack (auto-provisioned)
+## Model manifests
 
-- DiTs: Comfy-Org `minimax_h3_fl2va` INT8, `Minimax-h3_Singularity_ref2va` INT8 (T2V/I2V/R2V/V2V in one unet)
-- Text encoder: `qwen3vl_32b_heretic_minimax_h3_nvfp4` (Momoking)
-- Turbo LoRAs: lightx2v fl2v/ref2v 8-step · Style LoRAs: `h3-realism-people` (fal), `h3_character_swap` (akatz)
-- VAEs: video fp16 + audio fp32, `taeh3` preview · Face detailer: `face_yolov8m` + `sam_vit_b`
-- Enhancer LLM: Qwen3.5-9B Defiant-Fable NEO-MAX Q6_K GGUF + mmproj (also drives the Director's auto-Analyze/Enhance)
+`models/*.txt` — tab-separated: `<models subdir> <filename> <URL> [sha256] [size_bytes]` (`-` = unset).
+
+| Manifest | Contents |
+| --- | --- |
+| `all` | Everything (default for auto-provisioning) |
+| `ref2va` | What `video_minimax_h3_r2v` loads |
+| `t2va` | fl2va DiT, Heretic text encoder, fp16 video VAE, turbo + realism LoRAs |
+
+Validation:
+
+- **Image build** (`manifest_tools.py static` + `workflows`): rejects malformed lines, unknown subdirs, non-HF/non-https URLs, bad sha256/size values, conflicting duplicates; HEADs every URL and rejects failed downloads or a remote size that differs from the manifest; fails when a workflow loads a model no manifest lists. Offline builds: `--build-arg SKIP_NET_VALIDATION=1`.
+- **Volume** (`populate-volume.sh`): a file that is missing, empty or the wrong size is (re)downloaded; every download is verified (size + sha256, 3 attempts, bad files deleted); the script exits non-zero if anything fails. `VERIFY_HASH=true` also hashes files already present.
+- **Job**: before queuing, the handler checks that every model the workflow loads exists on the volume.
+
+Check manually: `python manifest_tools.py static models/*.txt` · `python manifest_tools.py workflows workflows-api/h3 models/all.txt` · `python manifest_tools.py verify /runpod-volume/models models/ref2va.txt --hash`. Tests: `python -m unittest discover -s tests`.
 
 ## Job input
+
+Inputs are mapped by **node title**:
 
 ```json
 {
   "input": {
-    "workflow": "MiniMaxH3-Director-Native.json",
-    "prompt": "she turns from the window, hair catching the golden light\nshe walks toward the camera, playful smile",
-    "global_prompt": "warm cinematic realism; her look stays the same in every shot",
-    "seconds": 10,
-    "images": ["<character sheet>"],
-    "enhance": true,
-    "video_size": "1344x768 (16:9)",
-    "upscale": true,
-    "rife": true
+    "workflow": "video_minimax_h3_r2v",
+    "inputs": {
+      "Input Text (Prompt)": "A slow camera arc around the subject...",
+      "INPUT - Frame Count": 121,
+      "Resolution Selector (Size)": {"aspect_ratio": "9:16 (Portrait Widescreen)", "megapixels": 0.4},
+      "Seed": 12345,
+      "Reference Image": ["<base64 or https URL>", "<second image>"]
+    }
   }
 }
 ```
 
-- **Director Native**: `prompt` = one idea per line (each = a segment, `seconds` split evenly); `global_prompt` = style prose; `subject_description` optional (auto-Analyze when empty); `enhance` = per-segment QwenVL autoprompting (default true)
-- **Director Storyboard**: `prompt` = one idea (timestamps welcome); `images` = up to 3 storyboard frames; `vl_preset` = `MiniMax › Director Storyboard` / `Director Prose`
-- Classic: `config` presets (`native`/`native_turbo`/`r2va_singularity`/`r2va_singularity_turbo`/`10eros`/`10eros_turbo`) swap DiT/LoRA/steps/sampler/shift; `lora` = style LoRA on Singularity (`none`/`realism`/`char_swap`)
-- `video_size` — `auto` (follows the image/stills) or an explicit MMH3 native preset (`1344x768 (16:9)`, `1184x864 (4:3)`, …)
-- `upscale` / `rife` — TensorRT post chain · `"action": "health"` — status + workflow list, no generation
+- A scalar sets the node's `value`; an object is merged into the node's inputs. Any other node title works the same way.
+- `Seed`: omit or `-1` for random (the used seed is returned). Falls back to `RandomNoise` nodes if none is titled `Seed`.
+- `Reference Image`: one image or a list, filled into `LoadImage` nodes in id order; unused slots are removed from the graph. More images than slots is an error.
+- `INPUT - Frame Count`: the current template has no such node, so it is reported in `warnings` and skipped. Titles that match no node are skipped the same way.
+- Invalid values return `{"error": "..."}`. Success returns `{"outputs": [...], "seed": N, "warnings": [...]}`.
+- `{"action": "health"}` — status, workflow and manifest lists, no generation.
+
+### Provision only some models
+
+```json
+{"input": {"models_manifest": "ref2va", "models_only": true}}
+```
+
+`models_manifest` accepts a manifest name, a list of names, inline manifest text, inline rows `[["loras", "x.safetensors", "https://huggingface.co/...", "<sha256>", 123]]`, or `{"include": ..., "lines": ...}`. Inline entries are restricted to https Hugging Face URLs. Without `models_only` the models are provisioned and then the job runs.
+
+Client: [exec/h3-serverless.ps1](exec/h3-serverless.ps1) is a generic runner — all parameters live in a job file such as [exec/ref2va_01.json](exec/ref2va_01.json) (`endpointId`, `outputDir`, `timeoutMinutes`, `input`). Strings in `input` that start with `@` are replaced by that file's base64. Run `$env:RUNPOD_API_KEY="..."; .\exec\h3-serverless.ps1 .\exec\ref2va_01.json` (`-EndpointId` or `RUNPOD_ENDPOINT_ID` can supply the endpoint instead).
 
 ## Custom nodes baked in
 

@@ -1,51 +1,64 @@
 """RunPod serverless handler for the MiniMax-H3 ComfyUI stack.
 
-Boots ComfyUI once per worker, then each job picks a workflow template by name,
-patches its widgets (prompt / camera_tag / duration / unet config), uploads any
-input media, queues the prompt, and returns the produced media as base64.
+Boots ComfyUI once per worker; each job picks a workflow template (API format,
+/opt/workflows) and fills it by *node title*, so callers never need node ids.
 
 Job input:
   {
-    "workflow": "MiniMaxH3-Turbo-R2VA-GGUF.json",   # file in /opt/workflows
-    "prompt":   "...",                             # enhancer/directive text
-    "config":   "native|native_turbo|r2va_native|r2va_native_turbo|10eros|10eros_turbo",
-    "camera_tag": "[ORBIT]",                       # optional
-    "seconds":  6,                                 # optional duration override
-    "images":   ["https://... or base64"],         # optional, fills LoadImage nodes in id order
-    "video":    "https://... or base64"            # optional, fills VHS_LoadVideo
+    "workflow": "video_minimax_h3_r2v",              # file in /opt/workflows (.json optional)
+    "inputs": {                                       # node title -> value
+      "Input Text (Prompt)": "...",
+      "INPUT - Frame Count": 121,
+      "Resolution Selector (Size)": {"aspect_ratio": "9:16 (Portrait Widescreen)", "megapixels": 0.4},
+      "Seed": 12345,                                  # -1 / omitted = random
+      "Reference Image": ["https://... or base64"]    # one or several, filled in node-id order
+    },
+    "models_manifest": "ref2va",                      # optional, see below
+    "models_only": false                              # true = only provision models, no generation
   }
+
+Rules for `inputs`:
+  - A scalar sets the node's `value` input; an object is merged into the node's inputs.
+  - `Seed` falls back to RandomNoise nodes and `Reference Image` to LoadImage nodes
+    when no node carries that exact title.
+  - A title that matches no node is reported in `warnings` and skipped.
+
+`models_manifest` provisions models onto the volume before the job runs:
+  "ref2va"                          named manifest (models/<name>.txt)
+  ["ref2va", "t2va"]                several named manifests
+  "diffusion_models\\tfoo.safetensors\\thttps://huggingface.co/..."   inline manifest text
+  [["loras", "x.safetensors", "https://huggingface.co/...", "<sha256>", 123]]   inline rows
+  {"include": "ref2va", "lines": [...]}   both
+
+{"action": "health"} reports status without touching ComfyUI.
 """
 
 import asyncio
 import base64
-import glob
 import json
 import os
 import random
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
-import urllib.request
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
-import runpod
+import manifest_tools
 
+SERVERLESS_DIR = Path(__file__).resolve().parent
 COMFY_DIR = os.environ.get("COMFYUI_DIR", "/workspace/runpod-slim/ComfyUI")
 COMFY_URL = "http://127.0.0.1:8188"
 WORKFLOWS_DIR = Path(os.environ.get("WORKFLOWS_DIR", "/opt/workflows"))
+MANIFESTS_DIR = Path(os.environ.get("MANIFESTS_DIR", SERVERLESS_DIR / "models"))
+VOL_ROOT = Path(os.environ.get("VOL_ROOT", "/runpod-volume"))
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "1800"))
-
-# Workflows boot-synced from the ForgeHub repo override the baked copies, so a
-# workflow edit lands at the next cold boot without rebuilding the image.
-FH_REPO = os.environ.get("FORGEHUB_REPO", "huchukato/ForgeHub")
-FH_BRANCH = os.environ.get("FORGEHUB_BRANCH", "main")
-FH_ENDPOINT = os.environ.get("FORGEHUB_ENDPOINT_NAME", "MiniMax H3")
-WF_SYNC_DIR = Path(os.environ.get("WF_SYNC_DIR", "/tmp/forgehub-workflows"))
-WF_SYNC_MANIFEST = WF_SYNC_DIR / ".manifest"
 
 # Output delivery: base64 inline under these limits, S3 offload above them.
 # RunPod's job-done callback drops results over ~20MB, so keep headroom.
@@ -53,15 +66,13 @@ INLINE_MAX = int(os.environ.get("OUTPUT_INLINE_MAX_MB", "10")) * 1024 * 1024
 INLINE_BUDGET = int(os.environ.get("OUTPUT_INLINE_BUDGET_MB", "15")) * 1024 * 1024
 S3_PREFIX = os.environ.get("S3_OUTPUT_PREFIX", "outputs")
 
-# Config → unet filename needle + sampler values (mirrors chat_service.py _MINIMAX_CONFIGS)
-MINIMAX_CONFIGS = {
-    "native":            {"unet": "fl2va",  "steps": 20, "sampler": "res_multistep", "scheduler": "simple", "shift_video": 12.0, "shift_audio": 3.0, "lora": None, "tau": None},
-    "native_turbo":      {"unet": "fl2va",  "steps": 8,  "sampler": "euler",         "scheduler": "simple", "shift_video": 6.0,  "shift_audio": 3.0, "lora": "fl2v_turbo",  "tau": 1.3},
-    "r2va_singularity":       {"unet": "Singularity", "steps": 20, "sampler": "res_multistep", "scheduler": "simple", "lora": None, "tau": None, "sigma_off": True},
-    "r2va_singularity_turbo": {"unet": "Singularity", "steps": 6,  "sampler": "euler",         "scheduler": "beta",   "lora": "ref2v_turbo_4step", "tau": 1.3, "sigma_off": True},
-    "10eros":            {"unet": "10eros", "steps": 20, "sampler": "res_multistep", "scheduler": "simple", "shift_video": 12.0, "shift_audio": 3.0, "lora": None, "tau": None},
-    "10eros_turbo":      {"unet": "10eros", "steps": 8,  "sampler": "euler",         "scheduler": "simple", "shift_video": 6.0,  "shift_audio": 3.0, "lora": "fusion_turbo", "tau": 1.3},
-}
+SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+SEED_MAX = 2**53 - 1
+MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".gif", ".wav", ".mp3", ".flac")
+
+
+class JobError(RuntimeError):
+    """Invalid job input — reported to the caller as-is."""
 
 
 def _http(path, payload=None, timeout=30):
@@ -106,38 +117,6 @@ def _boot_comfy():
     raise RuntimeError("ComfyUI did not become ready in 600s")
 
 
-def _sync_workflows():
-    try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{FH_REPO}/git/trees/{FH_BRANCH}?recursive=1",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "forgehub-worker"})
-        tree = json.loads(urllib.request.urlopen(req, timeout=60).read())
-        raw = lambda p: f"https://raw.githubusercontent.com/{FH_REPO}/{FH_BRANCH}/{p}"
-        wanted = []
-        for entry in sorted(tree.get("tree", []), key=lambda e: e["path"]):
-            mp = entry["path"]
-            if not (mp.startswith("workflows/") and mp.endswith(".meta.json")):
-                continue
-            meta = json.loads(urllib.request.urlopen(raw(mp), timeout=60).read())
-            if meta.get("endpoint_name") == FH_ENDPOINT:
-                wanted.append(mp[:-len(".meta.json")] + ".json")
-        WF_SYNC_DIR.mkdir(parents=True, exist_ok=True)
-        names = set()
-        for wp in wanted:
-            name = Path(wp).name
-            tmp = WF_SYNC_DIR / f"{name}.tmp"
-            tmp.write_bytes(urllib.request.urlopen(raw(wp), timeout=120).read())
-            os.replace(tmp, WF_SYNC_DIR / name)
-            names.add(name)
-        if WF_SYNC_MANIFEST.is_file():
-            for stale in set(WF_SYNC_MANIFEST.read_text().split()) - names:
-                (WF_SYNC_DIR / stale).unlink(missing_ok=True)
-        WF_SYNC_MANIFEST.write_text("\n".join(sorted(names)) + "\n")
-        print(f"[handler] workflow sync: {sorted(names)}", flush=True)
-    except Exception as exc:
-        print(f"[handler] workflow sync failed: {exc} — using baked workflows", flush=True)
-
-
 def _boot_in_bg():
     # ComfyUI boots on a daemon thread so the runpod handler is live (and the
     # `health` action answers) even while ComfyUI is still starting — or on
@@ -145,7 +124,6 @@ def _boot_in_bg():
     # network volume). Real jobs wait on _BOOT_DONE via _ensure_comfy().
     global _BOOT_ERR
     try:
-        _sync_workflows()
         _boot_comfy()
     except Exception as exc:
         _BOOT_ERR = exc
@@ -160,10 +138,23 @@ async def _ensure_comfy():
         raise RuntimeError(f"ComfyUI failed to boot: {_BOOT_ERR} (see /workspace/comfy.log)")
 
 
+# ── Media ────────────────────────────────────────────────────────────────────
+
 def _media_bytes(value):
-    if isinstance(value, str) and value.startswith("http"):
+    if not isinstance(value, str) or not value.strip():
+        raise JobError("image values must be a non-empty URL or base64 string")
+    value = value.strip()
+    if value.startswith(("http://", "https://")):
         return urllib.request.urlopen(value, timeout=120).read()
-    return base64.b64decode(value)
+    if value.startswith("data:"):
+        value = value.split(",", 1)[-1]
+    try:
+        data = base64.b64decode(value, validate=False)
+    except Exception as exc:
+        raise JobError(f"image is not valid base64: {exc}") from exc
+    if not data:
+        raise JobError("image decoded to zero bytes")
+    return data
 
 
 def _upload(filename, data):
@@ -179,513 +170,248 @@ def _upload(filename, data):
     return resp.get("name", filename)
 
 
+# ── Workflow loading + title-keyed input mapping ────────────────────────────
+
 def _load_workflow(name):
     """Workflow templates must be saved in ComfyUI *API format* (Export API),
-    where every node is keyed by id and inputs carry widget names — the UI
-    format's positional widgets_values can't be patched reliably."""
-    dirs = [WF_SYNC_DIR, WORKFLOWS_DIR] if WF_SYNC_MANIFEST.is_file() else [WORKFLOWS_DIR]
-    for base in dirs:
-        path = base / name
-        if not path.is_file():
-            path = base / f"{name}.json"
-        if path.is_file():
-            break
-    else:
-        raise RuntimeError(f"workflow template not found: {name} (available: {sorted(p.name for d in dirs for p in d.glob('*.json'))})")
-    wf = json.loads(path.read_text())
+    where every node is keyed by id and inputs carry widget names."""
+    if not isinstance(name, str) or not SAFE_NAME.match(name):
+        raise JobError("'workflow' must be a template file name")
+    path = WORKFLOWS_DIR / name
+    if not path.is_file():
+        path = WORKFLOWS_DIR / f"{name}.json"
+    if not path.is_file():
+        raise JobError(f"workflow template not found: {name} (available: {_workflow_names()})")
+    wf = json.loads(path.read_text(encoding="utf-8"))
     if "nodes" in wf:
-        raise RuntimeError(f"{name} is a UI-format graph; re-export it with 'Export API' so widgets are named")
+        raise JobError(f"{name} is a UI-format graph; re-export it with 'Export API'")
     return wf
 
 
-def _comfy_route(path, payload, timeout=300):
-    """POST to a ComfyUI HTTP route and return the JSON body, or {} on any failure.
+def _workflow_names():
+    return sorted(p.name for p in WORKFLOWS_DIR.glob("*.json"))
 
-    Used for the Director's QwenVL routes (analyze/enhance) — they run inside the
-    ComfyUI process this handler booted, so localhost is all it takes. A route that
-    is missing (older image without the Director node) degrades to {} and the
-    caller falls back to the raw text.
-    """
+
+def _node_title(node):
+    return str((node.get("_meta") or {}).get("title") or "")
+
+
+def _nodes_by_title(prompt, title):
+    exact = [i for i, n in prompt.items() if _node_title(n) == title]
+    if exact:
+        return sorted(exact, key=_id_key)
+    low = title.lower()
+    return sorted((i for i, n in prompt.items() if _node_title(n).lower() == low), key=_id_key)
+
+
+def _nodes_by_class(prompt, class_type):
+    return sorted((i for i, n in prompt.items() if n.get("class_type") == class_type), key=_id_key)
+
+
+def _id_key(node_id):
+    return (0, int(node_id)) if str(node_id).isdigit() else (1, str(node_id))
+
+
+def _as_int(title, value, minimum=None):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise JobError(f"'{title}' must be an integer")
     try:
-        return json.loads(_http(path, payload, timeout=timeout))
-    except Exception as exc:
-        print(f"[handler] {path} failed: {exc}", flush=True)
-        return {}
+        number = int(float(value)) if float(value) == int(float(value)) else None
+    except (ValueError, OverflowError):
+        number = None
+    if number is None:
+        raise JobError(f"'{title}' must be an integer, got {value!r}")
+    if minimum is not None and number < minimum:
+        raise JobError(f"'{title}' must be >= {minimum}")
+    return number
 
 
-def _job_style_text(job):
-    """The form's Video style option rides as a job field: the "[TAG] - " prefix
-    strips off the same way the prompt-prepend path does."""
-    style_raw = str(job.get("style") or "").strip()
-    return re.sub(r"^\[[^\]]*\]\s*-\s*", "", style_raw) if style_raw and style_raw != "None" else ""
-
-
-def _director_timeline(job):
-    """Build the Director's timeline_data from the ForgeHub form, or None.
-
-    The form gives the charsheet (images[0]), the segment ideas one per line in
-    `prompt`, an optional style prose in `global_prompt`, and `seconds` split evenly
-    across the ideas. The subject description comes from the form or is auto-generated
-    by the Analyze route; each idea is then expanded by the Enhance route — the same
-    built-in QwenVL the canvas buttons use — when `enhance` is on (default).
-
-    The charsheet travels INSIDE the timeline (subjects[0].images as b64) — the
-    Director's API graph has no LoadImage; that is how load_ref_image_tensors reads it.
-    """
-    ideas = [l.strip() for l in str(job.get("prompt") or "").splitlines() if l.strip()]
-    if not ideas:
-        return None
-
-    char_b64 = ""
-    images = job.get("images") or []
-    if images:
-        raw = _media_bytes(images[0])
-        if raw:
-            char_b64 = base64.b64encode(raw).decode()
-
-    # The resolved style text opens the global prompt — the enhance's style
-    # context and the compiled prompt's first lines carry it.
-    global_prompt = "\n".join(x for x in (_job_style_text(job), str(job.get("global_prompt") or "")) if x.strip())
-
-    seconds = int(job.get("seconds") or 10)
-    per = max(1, round(seconds / len(ideas)))
-
-    subject_desc = (job.get("subject_description") or "").strip()
-    retention = ""
-    if not subject_desc and char_b64:
-        res = _comfy_route("/minimax_director/analyze_character", {
-            "image_b64": char_b64, "char_index": 0, "kind": "person",
-            "provider": "qwenvl", "base_url": "", "model": "",
-        })
-        if res.get("status") == "success":
-            subject_desc = res.get("description") or ""
-            retention = res.get("retention_note") or ""
-
-    fps = 24
-    segments = []
-    cursor = 0
-    for idea in ideas:
-        text = idea
-        if job.get("enhance", True) and char_b64:
-            res = _comfy_route("/minimax_director/enhance_segment", {
-                "image_b64": char_b64, "segment_text": idea,
-                "global_prompt": global_prompt,
-                "provider": "qwenvl", "base_url": "", "model": "",
-            })
-            if res.get("status") == "success" and (res.get("text") or "").strip():
-                text = res["text"].strip()
-        segments.append({
-            "id": uuid.uuid4().hex, "start": cursor * fps, "length": per * fps,
-            "prompt": text, "type": "text", "isEndFrame": False,
-        })
-        cursor += per
-
-    total = cursor * fps
-    ref_raw = str(job.get("reference_mode") or "REF2VA")
-    ref_mode = "OFF" if ref_raw.strip().lower().startswith("off") else "REF2VA"
-    tdata = {
-        "mainTrackEnabled": True, "audioTrackEnabled": True, "motionTrackEnabled": True,
-        "propHeight": 90, "globalPropHeight": 126,
-        "showFilenames": False, "showPromptZones": True,
-        "overrideAudio": False, "inpaint_audio": True,
-        "global_prompt": global_prompt,
-        "retake_global_prompt": "",
-        "overall_soundscape": job.get("overall_soundscape") or "",
-        "non_diegetic_music": job.get("non_diegetic_music") or "",
-        "prompt_override": "", "prompt_override_on": False,
-        "retakeMode": False, "retakeStart": 0, "retakeLength": 0,
-        "retakePrompt": "", "retakeStrength": 1, "retakeVideo": None,
-        "normalStartFrame": 0, "normalDurationFrames": total,
-        "reference_mode": ref_mode, "prompt_format": "minimax",
-        "analyzeProvider": "qwenvl", "analyzeBaseUrl": "", "analyzeModel": "",
-        "summary": job.get("summary") or "", "task_type_override": "",
-        "subjectSlotCount": 1,
-        "subjects": [{
-            "description": subject_desc, "retentionNote": retention,
-            "images": ([{"b64": char_b64}] if char_b64 else []),
-        }],
-        "segments": segments, "motionSegments": [], "audioSegments": [],
-    }
-    return json.dumps(tdata), total
-
-
-def _patch(prompt, job):
-    director_nodes = [n for n in prompt.values()
-                      if n.get("class_type") == "MiniMaxH3DirectorCS"]
-    # Two Director flows: Native (the timeline owns the text — build it from the
-    # form) and Storyboard (the in-graph QwenVL feeds external_prompt and the refs
-    # ride the ref_images socket — the existing heuristics cover it; only the
-    # window follows `seconds`). Injecting a timeline into the Storyboard would
-    # double the references (subject b64 + socket), so it gets window-only.
-    native_director = any(
-        not isinstance(n.get("inputs", {}).get("external_prompt"), list)
-        for n in director_nodes)
-    director = _director_timeline(job) if native_director else None
-    director_tdata, director_total = director if director else (None, 0)
-    # The Director graphs carry their own two unets; the config preset's unet
-    # needle would rewrite both to one model — keep the preset's sampler/LoRA
-    # parts but blind the needle.
-    cfg = MINIMAX_CONFIGS.get(job.get("config"))
-    if director_nodes and cfg:
-        cfg = {**cfg, "unet": None}
-    base = re.sub(r"[^\w.-]+", "-", str(job.get("job_name") or f"job_{uuid.uuid4().hex[:8]}")).strip("-")
-    images = [_upload(f"{base}_{i}.png", _media_bytes(v)) for i, v in enumerate(job.get("images") or [])]
-    video_name = None
-    if job.get("video"):
-        video_name = _upload(f"{base}.mp4", _media_bytes(job["video"]))
-
-    def _find_file(kind, needle):
-        """Locate a model file under the volume + local model dirs."""
-        hits = sorted(
-            h for pat in (f"/runpod-volume/models/{kind}/**/*", f"{COMFY_DIR}/models/{kind}/**/*")
-            for h in glob.glob(pat, recursive=True)
-            if needle.lower() in Path(h).name.lower())
-        # "fl2va"/"ref2va" needles must not grab 10Eros files which also contain them
-        if needle.lower() in ("fl2va", "ref2va"):
-            hits = [h for h in hits if "eros" not in Path(h).name.lower()] or hits
-        return Path(hits[0]).name if hits else None
-
-    img_idx = 0
-    drop_lora = None
-    sigma_off = {}
-    for nid, node in prompt.items():
-        ct = node.get("class_type", "")
-        inp = node.get("inputs", {})
-
-        if "LoadImage" in ct:
-            if img_idx < len(images):
-                inp["image"] = images[img_idx]
-                if "LoadImageMiniState" in inp:
-                    inp["LoadImageMiniState"] = images[img_idx]
-                if "LoadImagePixState" in inp:
-                    try:
-                        state = json.loads(inp["LoadImagePixState"])
-                        state["orig_name"] = images[img_idx]
-                        inp["LoadImagePixState"] = json.dumps(state)
-                    except Exception:
-                        inp.pop("LoadImagePixState", None)
-                img_idx += 1
-        elif "LoadVideo" in ct and video_name:
-            inp["video"] = video_name
-        if ct == "MiniMaxH3DirectorCS" and director_nodes:
-            # Native: inject the form-built timeline. Storyboard: leave the baked
-            # one (its refs come from the socket). Either way the window follows
-            # the timeline's total, or `seconds` when no timeline was built.
-            if director_tdata is not None:
-                inp["timeline_data"] = director_tdata
-            total = director_total or (int(job["seconds"]) * 24 if job.get("seconds") else 0)
-            if total:
-                for wkey, val in (("start_frame", 0), ("end_frame", total),
-                                  ("duration_frames", total),
-                                  ("start_second", 0), ("duration_seconds", total / 24)):
-                    if wkey in inp:
-                        inp[wkey] = val
-            if director_tdata is not None:
-                continue
-        if director_tdata is None and job.get("prompt") is not None and "prompt" in inp and not isinstance(inp["prompt"], list):
-            inp["prompt"] = job["prompt"]
-        if director_tdata is None and job.get("prompt") is not None and ct == "WildcardProcessor":
-            inp["text"] = job["prompt"]
-            inp["populated_text"] = job["prompt"]
-        if director_tdata is None and job.get("camera_tag") and "camera_tag" in inp:
-            inp["camera_tag"] = job["camera_tag"]
-        if director_tdata is None and job.get("vl_preset"):
-            for wkey in ("preset_prompt", "enhancement_style"):
-                if wkey in inp:
-                    inp[wkey] = job["vl_preset"]
-        if director_tdata is None and job.get("enhance") is False and "passthrough" in inp:
-            inp["passthrough"] = True
-        # Storyboard: the QwenVL feeds external_prompt, so the style directive
-        # cannot ride the global prompt — a StringConcatenate node prepends it
-        # verbatim to the compiled prompt instead of letting the VLM weave it in.
-        if director_nodes and director_tdata is None and ct == "StringConcatenate" \
-                and "string_a" in inp and not isinstance(inp["string_a"], list):
-            inp["string_a"] = _job_style_text(job)
-        if director_tdata is None and job.get("seconds"):
-            sec = int(job["seconds"])
-            if "duration" in inp:
-                inp["duration"] = f"{sec}s"
-            elif "length" in inp and not isinstance(inp["length"], list):
-                inp["length"] = sec * 24
-            elif "value" in inp and ct.startswith("Primitive"):
-                inp["value"] = sec
-        if "lora_name" in inp:
-            cur_lora = str(inp.get("lora_name", "")).lower()
-            if "realism" in cur_lora or "character_swap" in cur_lora:
-                # Style LoRA slot (Singularity recipe): job.lora =
-                # none | realism | char_swap. Disabled/missing → drop the
-                # node entirely below (ComfyUI validates lora_name even at
-                # strength 0), so mark it for removal.
-                sel = job.get("lora") or "none"
-                drop_lora = nid
-                if sel != "none":
-                    needle = {"realism": "realism", "char_swap": "character_swap"}.get(sel, sel)
-                    found = _find_file("loras", needle)
-                    if not found:
-                        raise RuntimeError(f"Style LoRA '{sel}' not found on the volume")
-                    inp["lora_name"] = found
-                    for skey in ("strength_model", "strength_clip"):
-                        if skey in inp:
-                            inp[skey] = 1.0
-            elif cfg is not None:
-                if cfg["lora"]:
-                    found = _find_file("loras", cfg["lora"])
-                    if found:
-                        inp["lora_name"] = found
-                        for skey in ("strength_model", "strength_clip"):
-                            if skey in inp:
-                                inp[skey] = 1.0
-                else:
-                    for skey in ("strength_model", "strength_clip"):
-                        if skey in inp:
-                            inp[skey] = 0.0
-        elif cfg is not None and cfg.get("unet") and "unet_name" in inp:  # MiniMax H3 generator/enhancer node
-            needle = cfg["unet"]
-            if needle.lower() not in str(inp.get("unet_name", "")).lower():
-                found = _find_file("unet", needle) or _find_file("diffusion_models", needle)
-                if found:
-                    inp["unet_name"] = found
-            for wkey, ckey in (("steps", "steps"), ("sampler_name", "sampler"), ("scheduler", "scheduler"),
-                               ("shift_video", "shift_video"), ("shift_audio", "shift_audio")):
-                if wkey in inp and not isinstance(inp[wkey], list):
-                    inp[wkey] = cfg[ckey]
-            if cfg.get("tau") and "tau" in inp:
-                inp["tau"] = cfg["tau"]
-        if cfg is not None:
-            # Sampler/step/shift values live on dedicated nodes, not on the
-            # unet loader — patch them by class_type or the preset would only
-            # swap weights/LoRA while the template settings silently win.
-            if ct == "KSamplerSelect" and "sampler_name" in inp:
-                inp["sampler_name"] = cfg["sampler"]
-            elif ct == "BasicScheduler":
-                for wkey in ("steps", "scheduler"):
-                    if wkey in inp:
-                        inp[wkey] = cfg[wkey]
-            elif ct == "MiniMaxH3SigmaShift":
-                if cfg.get("sigma_off"):
-                    # API format ignores UI bypass modes — physically remove
-                    # the node and rewire its consumers to its model source.
-                    sigma_off[nid] = inp.get("model")
-                else:
-                    for wkey in ("shift_video", "shift_audio"):
-                        if wkey in inp:
-                            inp[wkey] = cfg[wkey]
-    if sigma_off:
-        for nid in sigma_off:
-            del prompt[nid]
-        for n in prompt.values():
-            for k, v in n.get("inputs", {}).items():
-                if isinstance(v, list) and v and v[0] in sigma_off:
-                    n["inputs"][k] = sigma_off[v[0]]
-    # LoadImage nodes left on the template filename (fewer uploads than loaders —
-    # e.g. single-image edits with an optional image2) would fail validation;
-    # drop them and unlink their consumers instead.
-    uploaded = set(images)
-    dead = [nid for nid, n in prompt.items()
-            if "LoadImage" in n.get("class_type", "")
-            and n.get("inputs", {}).get("image") not in uploaded]
-    # Same for reference video loaders left on their template value when the
-    # job carries no video (R2VA recipes have an optional ref_videos input).
-    dead += [nid for nid, n in prompt.items()
-             if "LoadVideo" in n.get("class_type", "")
-             and n.get("inputs", {}).get("video") != video_name]
-    if dead:
-        while dead:
-            for nid in dead:
-                del prompt[nid]
-            emptied = []
-            for nid, n in prompt.items():
-                for k in [k for k, v in n.get("inputs", {}).items()
-                          if isinstance(v, list) and v and v[0] in dead]:
-                    del n["inputs"][k]
-                if not n["inputs"]:
-                    emptied.append(nid)
-            # Cascade: nodes left with zero inputs after unlinking (e.g. a
-            # PixaromaImageInfo whose only input was a dropped loader) would
-            # fail validation on required inputs — drop them too.
-            dead = emptied
-    if drop_lora is not None:
-        # Rewire the dropped style LoRA's consumers to its model source.
-        src = prompt[drop_lora].get("inputs", {}).get("model")
-        del prompt[drop_lora]
-        if isinstance(src, list):
-            for n in prompt.values():
-                for k, v in n.get("inputs", {}).items():
-                    if isinstance(v, list) and v and v[0] == drop_lora:
-                        n["inputs"][k] = src
-    # Post-processing toggles: the graph chain is  save.images <- rife.frames
-    # <- upscale.images <- VAEDecode.  upscale=false rewires rife.frames to the
-    # decoder output; rife=false rewires save.images to rife's own source.
-    upscaler = next((n for n in prompt.values() if "upscaler_trt_model" in n.get("inputs", {})), None)
-    rife = next((n for n in prompt.values() if "rife_trt_model" in n.get("inputs", {})), None)
-    saver = next((n for n in prompt.values()
-                  if isinstance(n.get("inputs", {}).get("images"), list)
-                  and n["inputs"]["images"]
-                  and rife is not None
-                  and n["inputs"]["images"][0] == next(k for k, v in prompt.items() if v is rife)), None) if rife else None
-    if not job.get("upscale", True) and upscaler is not None and rife is not None:
-        rife["inputs"]["frames"] = upscaler["inputs"]["images"]
-    if not job.get("rife", True) and rife is not None and saver is not None:
-        saver["inputs"]["images"] = rife["inputs"]["frames"]
-        # The VHS saver bakes 48 (the RIFE'd rate) — halve it. The Director's
-        # CreateVideo takes fps as a LINK from the Director's own frame_rate
-        # output, which is already the pre-RIFE rate: leave it alone.
-        if "frame_rate" in saver["inputs"] and not isinstance(saver["inputs"]["frame_rate"], list):
-            saver["inputs"]["frame_rate"] = saver["inputs"]["frame_rate"] // int(rife["inputs"].get("multiplier", 2) or 2)
-    # Upscaler model / target overrides — the loader node feeds "upscaler_trt_model".
-    upscaler_loader = next((n for n in prompt.values()
-                            if n.get("class_type", "").endswith("LoadUpscalerTensorrtModel")), None)
-    if upscaler_loader is not None and job.get("upscale_model"):
-        upscaler_loader["inputs"]["model"] = job["upscale_model"]
-    if upscaler is not None and job.get("upscale_target"):
-        upscaler["inputs"]["resize_to"] = job["upscale_target"]
-    # Output size: "1344x768" rewrites the size/latent state and syncs the
-    # Qwen encoder's reference resolution to the long edge. The new Pixaroma
-    # helper nodes (Sizes/Dropdown) replace the old PixaromaResolution node.
-    # Dropdowns feeding a TextEncodeQwenImage21 "resolution" input only —
-    # other PixaromaDropdown nodes may control unrelated widgets.
-    enc_ids = {nid for nid, n in prompt.items()
-               if n.get("class_type", "").startswith("TextEncodeQwenImage21")}
-    dropdown_ids = set()
-    for nid in enc_ids:
-        res = prompt[nid].get("inputs", {}).get("resolution")
-        if isinstance(res, list) and res and str(res[0]) in prompt:
-            dropdown_ids.add(str(res[0]))
-    job_size_raw = str(job.get("video_size") or job.get("image_size") or "")
-    if job_size_raw.strip().lower().startswith("auto"):
-        # "auto": the PVR keeps its baked behavior (use_image_aspect drives it);
-        # the Director's canvas derives from the first timeline image (0x0).
-        for node in prompt.values():
-            if node.get("class_type") == "MiniMaxH3DirectorCS":
-                inp = node.setdefault("inputs", {})
-                inp["custom_width"], inp["custom_height"] = 0, 0
-    m = re.match(r"(\d+)\s*x\s*(\d+)", job_size_raw)
-    if m:
-        w, h = int(m.group(1)), int(m.group(2))
-        for nid, node in prompt.items():
-            ct = node.get("class_type", "")
-            inp = node.get("inputs", {})
-            if ct == "PixaromaResolution":
-                try:
-                    state = json.loads(inp.get("ResolutionState") or "{}")
-                except Exception:
-                    state = {}
-                state["w"], state["h"] = w, h
-                inp["ResolutionState"] = json.dumps(state)
-            elif ct == "PixaromaSizes":
-                try:
-                    state = json.loads(inp.get("SizesState") or "{}")
-                except Exception:
-                    state = {}
-                state["w"], state["h"] = w, h
-                inp["SizesState"] = json.dumps(state)
-            elif ct == "EmptyLatentImagePresets":
-                pw, ph = (w, h) if w >= h else (h, w)
-                ratios = {
-                    (1024, 1024): "1:1",
-                    (1152, 896): "1.286:1",
-                    (1216, 832): "1.46:1",
-                    (1344, 768): "1.75:1",
-                    (1536, 640): "2.4:1",
-                }
-                ratio = ratios.get((pw, ph))
-                if ratio:
-                    inp["dimensions"] = f"{pw} x {ph} ({ratio})"
-                    inp["invert"] = h > w
-            elif ct == "PixaromaDropdown" and str(nid) in dropdown_ids and inp.get("DropdownState"): 
-                try:
-                    state = json.loads(inp["DropdownState"])
-                except Exception:
-                    continue
-                if state.get("type") == "int":
-                    state["value"] = str(max(w, h))
-                    inp["DropdownState"] = json.dumps(state)
-            elif ct.startswith("TextEncodeQwenImage21") and isinstance(inp.get("resolution"), int):
-                inp["resolution"] = max(w, h)
-            elif ct == "MiniMaxH3DirectorCS":
-                # the Director's own canvas: custom_width/height are its size widgets
-                inp["custom_width"], inp["custom_height"] = w, h
-            elif ct == "ComfyUI-PerfectVideoResolution":
-                # explicit size beats the tier labels: _parse_resolution falls
-                # through to _parse_size for a "WxH" value. use_image_aspect off —
-                # a picked size is literal; "auto" never reaches this branch.
-                inp["resolution"] = f"{w}x{h}"
-                inp["use_image_aspect"] = False
-    # Explicit encoder resolution (job["resolution"]) overrides the
-    # image_size-derived value on the PixaromaDropdown / direct int input.
-    res_override = job.get("resolution")
-    if res_override:
-        try:
-            res_value = str(int(res_override))
-        except (TypeError, ValueError):
-            res_value = str(res_override)
-        for nid in dropdown_ids:
-            inp = prompt[nid].setdefault("inputs", {})
-            try:
-                state = json.loads(inp.get("DropdownState") or "{}")
-            except Exception:
-                continue
-            state["value"] = res_value
-            inp["DropdownState"] = json.dumps(state)
-        for nid in enc_ids:
-            inp = prompt[nid].setdefault("inputs", {})
-            if isinstance(inp.get("resolution"), int):
-                inp["resolution"] = int(res_value)
-    # Per-job seed: baked seeds would repeat identical results across jobs.
-    # An explicit job["seed"] pins every seed consumer to the same value.
-    job_seed = job.get("seed")
-    if job_seed is None:
-        job_seed = random.randrange(0, 2**32)
-    for node in prompt.values():
-        inp = node.get("inputs", {})
-        class_type = node.get("class_type", "")
-        node_seed = job_seed % (2**32)
-        if class_type == "PixaromaSeed":
-            inp["seed"] = node_seed
-            try:
-                state = json.loads(inp.get("SeedState") or "{}")
-            except Exception:
-                state = {}
-            state["runSeed"] = node_seed
-            inp["SeedState"] = json.dumps(state)
+def _set_value(prompt, node_ids, title, value):
+    for node_id in node_ids:
+        node_inputs = prompt[node_id].setdefault("inputs", {})
+        if isinstance(value, dict):
+            node_inputs.update(value)
             continue
-        for skey in ("seed", "noise_seed"):
-            if isinstance(inp.get(skey), int) and not isinstance(inp.get(skey), bool):
-                inp[skey] = node_seed
-    # %date:fmt% tokens are resolved by the ComfyUI frontend only for widget
-    # values — an API-format prompt reaches the nodes literally (VHS then saves
-    # the raw token into the filename and /view 404s). Expand here with the
-    # same field codes as Pixaroma's _expand_date_tokens.
-    now = time.localtime()
-    fields = {
-        "d": now.tm_mday, "dd": f"{now.tm_mday:02d}",
-        "M": now.tm_mon, "MM": f"{now.tm_mon:02d}",
-        "h": now.tm_hour, "hh": f"{now.tm_hour:02d}",
-        "H": now.tm_hour, "HH": f"{now.tm_hour:02d}",
-        "m": now.tm_min, "mm": f"{now.tm_min:02d}",
-        "s": now.tm_sec, "ss": f"{now.tm_sec:02d}",
-        "yy": f"{now.tm_year % 100:02d}", "yyyy": now.tm_year,
-    }
-    for n in prompt.values():
-        for k, v in n.get("inputs", {}).items():
-            if isinstance(v, str) and "%date:" in v:
-                n["inputs"][k] = re.sub(
-                    r"%date:([^%]+)%",
-                    lambda m: "".join(str(fields.get(t, t))
-                                      for t in re.findall(r"dd?|MM?|hh?|HH?|mm?|ss?|yyy?y?|.", m.group(1))),
-                    v)
-    return prompt
+        if "value" in node_inputs:
+            key = "value"
+        else:
+            literals = [k for k, v in node_inputs.items() if not isinstance(v, list)]
+            if len(literals) != 1:
+                raise JobError(f"'{title}' (node {node_id}) has no single value input; pass an object instead")
+            key = literals[0]
+        node_inputs[key] = value
 
 
-def _apply_node_params(prompt, params):
-    """Apply generic {node_id:widget} patches, after the MMH3 presets."""
-    for key, value in (params or {}).items():
-        node_id, _, widget = key.rpartition(":")
-        node = prompt.get(node_id)
-        if isinstance(node, dict) and widget:
-            node.setdefault("inputs", {})[widget] = value
-    return prompt
+def _prune_nodes(prompt, node_ids):
+    """Drop nodes and every input link that pointed at them."""
+    gone = {str(i) for i in node_ids}
+    for i in gone:
+        prompt.pop(i, None)
+    for node in prompt.values():
+        inputs = node.get("inputs", {})
+        for key in [k for k, v in inputs.items()
+                    if isinstance(v, list) and v and str(v[0]) in gone]:
+            del inputs[key]
 
+
+def _apply_reference_images(prompt, title, value, upload, job_id):
+    loaders = _nodes_by_title(prompt, title) or _nodes_by_class(prompt, "LoadImage")
+    images = value if isinstance(value, list) else [value]
+    images = [v for v in images if v not in (None, "")]
+    if len(images) > len(loaders):
+        raise JobError(f"'{title}': {len(images)} images given but the workflow has {len(loaders)} image slot(s)")
+    for i, (node_id, item) in enumerate(zip(loaders, images)):
+        prompt[node_id].setdefault("inputs", {})["image"] = upload(f"{job_id}_ref{i}.png", _media_bytes(item))
+    _prune_nodes(prompt, loaders[len(images):])
+    return len(images)
+
+
+def apply_inputs(prompt, inputs, upload, job_id="job"):
+    """Fill a workflow in place from {node title: value}.
+
+    Returns (warnings, seed). Raises JobError on invalid values."""
+    if not isinstance(inputs, dict):
+        raise JobError("'inputs' must be an object mapping node titles to values")
+    warnings, seed = [], None
+    handled_seed = False
+
+    for title, value in inputs.items():
+        key = title.strip().lower()
+
+        if key == "seed":
+            handled_seed = True
+            nodes = _nodes_by_title(prompt, title) or _nodes_by_class(prompt, "RandomNoise")
+            if not nodes:
+                warnings.append(f"no node found for '{title}' — skipped")
+                continue
+            seed = _as_int(title, value, -1) if value not in (None, "") else -1
+            if seed == -1:
+                seed = random.randint(0, SEED_MAX)
+            elif seed < 0:
+                raise JobError(f"'{title}' must be >= 0 (or -1 for random)")
+            for node_id in nodes:
+                prompt[node_id].setdefault("inputs", {})["noise_seed"] = seed
+            continue
+
+        if key == "reference image":
+            if value is None:
+                continue
+            if not (_nodes_by_title(prompt, title) or _nodes_by_class(prompt, "LoadImage")):
+                warnings.append(f"no node found for '{title}' — skipped")
+                continue
+            _apply_reference_images(prompt, title, value, upload, job_id)
+            continue
+
+        nodes = _nodes_by_title(prompt, title)
+        if not nodes:
+            warnings.append(f"no node found for '{title}' — skipped")
+            continue
+
+        if key == "input - frame count":
+            value = _as_int(title, value, 1)
+        elif key == "input text (prompt)":
+            if not isinstance(value, str) or not value.strip():
+                raise JobError(f"'{title}' must be a non-empty string")
+        elif key == "resolution selector (size)":
+            if not isinstance(value, dict):
+                raise JobError(f"'{title}' must be an object like {{\"aspect_ratio\": \"16:9 (Widescreen)\", \"megapixels\": 0.4}}")
+            if "aspect_ratio" in value and not isinstance(value["aspect_ratio"], str):
+                raise JobError(f"'{title}'.aspect_ratio must be a string")
+            for field in ("megapixels", "multiple"):
+                if field in value and (isinstance(value[field], bool) or not isinstance(value[field], (int, float)) or value[field] <= 0):
+                    raise JobError(f"'{title}'.{field} must be a positive number")
+        _set_value(prompt, nodes, title, value)
+
+    if not handled_seed:
+        # An unchanged seed would hit ComfyUI's result cache and skip execution.
+        for node_id in _nodes_by_class(prompt, "RandomNoise"):
+            seed = random.randint(0, SEED_MAX)
+            prompt[node_id].setdefault("inputs", {})["noise_seed"] = seed
+    return warnings, seed
+
+
+def _check_models_present(prompt):
+    """Fail fast with the missing file names instead of a ComfyUI validation dump."""
+    if not (VOL_ROOT / "models").is_dir():
+        return
+    missing = [f"{'/'.join(subdirs)}/{name}" for name, subdirs in manifest_tools.prompt_models(prompt)
+               if not any((VOL_ROOT / "models" / s / name).is_file() for s in subdirs)]
+    if missing:
+        raise JobError("models missing on the volume (send models_manifest to provision them): "
+                       + ", ".join(sorted(set(missing))))
+
+
+# ── Model provisioning ───────────────────────────────────────────────────────
+
+def _resolve_manifest_spec(spec, tmpdir):
+    """Turn a job's `models_manifest` into a list of manifest file paths."""
+    paths, rows, includes = [], [], []
+
+    def include(name):
+        if not isinstance(name, str) or not SAFE_NAME.match(name):
+            raise JobError(f"invalid manifest name: {name!r}")
+        path = MANIFESTS_DIR / f"{name}.txt"
+        if not path.is_file():
+            avail = sorted(p.stem for p in MANIFESTS_DIR.glob("*.txt"))
+            raise JobError(f"unknown manifest '{name}' (available: {avail})")
+        includes.append(str(path))
+
+    def row_text(row):
+        if not isinstance(row, (list, tuple)) or not 3 <= len(row) <= 5:
+            raise JobError("manifest rows must be [subdir, filename, url, sha256?, size?]")
+        return "\t".join(str(c) for c in row)
+
+    def add(item):
+        if isinstance(item, str):
+            if "\t" in item or "\n" in item:
+                rows.append(item)
+            else:
+                include(item.strip())
+        elif isinstance(item, list) and item and all(isinstance(r, (list, tuple)) for r in item):
+            rows.extend(row_text(r) for r in item)
+        elif isinstance(item, list):
+            for sub in item:
+                add(sub)
+        elif isinstance(item, dict):
+            unknown = set(item) - {"include", "lines"}
+            if unknown:
+                raise JobError(f"unknown models_manifest keys: {sorted(unknown)}")
+            for name in ([item["include"]] if isinstance(item.get("include"), str) else item.get("include") or []):
+                include(name)
+            if item.get("lines"):
+                add(item["lines"])
+        else:
+            raise JobError("models_manifest must be a manifest name, list, inline text or object")
+
+    add(spec)
+    paths.extend(includes)
+    if rows:
+        inline = Path(tmpdir) / "inline.txt"
+        inline.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        paths.append(str(inline))
+    if not paths:
+        raise JobError("models_manifest is empty")
+    return paths
+
+
+def _provision_models(spec):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = _resolve_manifest_spec(spec, tmpdir)
+        _, errors = manifest_tools.load_manifests(paths)
+        if errors:
+            raise JobError("invalid models_manifest: " + "; ".join(errors))
+        proc = subprocess.run(
+            [str(SERVERLESS_DIR / "populate-volume.sh"), *paths],
+            capture_output=True, text=True, env={**os.environ, "VOL_ROOT": str(VOL_ROOT)})
+        tail = (proc.stdout + proc.stderr)[-1500:]
+        print(f"[handler] populate rc={proc.returncode}\n{tail}", flush=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"model provisioning failed: {tail}")
+        entries, _ = manifest_tools.load_manifests(paths)
+        return sorted(f"{e.subdir}/{e.name}" for e in entries)
+
+
+# ── ComfyUI execution + outputs ─────────────────────────────────────────────
 
 def _interrupt_prompt(prompt_id):
     """Best-effort ComfyUI abort for a cancelled job: dequeue if pending,
@@ -772,8 +498,8 @@ def _emit_file(filename, data, job, inline_used):
 
 
 def _prune_volume_outputs(max_age_s=86400):
-    """Drop stale volume output dirs — ForgeHub downloads right after the job."""
-    root = Path("/runpod-volume") / S3_PREFIX
+    """Drop stale volume output dirs."""
+    root = VOL_ROOT / S3_PREFIX
     cutoff = time.time() - max_age_s
     try:
         for d in root.iterdir():
@@ -790,18 +516,13 @@ def _collect_new_files(since_ts, job, inline_used):
         files = sorted(p for p in out_dir.rglob("*") if p.is_file() and p.stat().st_mtime >= since_ts)
     except Exception:
         return []
+    return [_emit_file(p.name, p.read_bytes(), job, inline_used)
+            for p in files if p.suffix.lower() in MEDIA_EXTS]
+
+
+def _collect_outputs(history_entry, job, inline_used):
     out = []
-    for p in files:
-        if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".gif", ".wav", ".mp3", ".flac"):
-            continue
-        out.append(_emit_file(p.name, p.read_bytes(), job, inline_used))
-    return out
-
-
-def _collect_outputs(history_entry, prompt, job, inline_used):
-    out, texts = [], {}
     for node_id, node_out in (history_entry.get("outputs") or {}).items():
-        print(f"[handler] output node {node_id}: keys={list(node_out.keys())}", flush=True)
         for key in ("images", "gifs", "videos"):
             for item in node_out.get(key, []) or []:
                 params = urllib.parse.urlencode({
@@ -811,66 +532,62 @@ def _collect_outputs(history_entry, prompt, job, inline_used):
                 })
                 data = _http(f"/view?{params}", timeout=300)
                 out.append(_emit_file(item["filename"], data, job, inline_used))
-        src = (prompt or {}).get(node_id, {}).get("inputs", {}).get("source")
-        if not isinstance(src, list):  # only ShowText-style nodes carry live text
-            continue
-        for t in node_out.get("text", []) or []:  # ShowText nodes → prompt trace
-            src_ct = (prompt or {}).get(str(src[0]), {}).get("class_type", "")
-            label = "Wildcards expanded" if "Wildcard" in src_ct else "Final prompt (QwenVL)"
-            texts[label] = t if isinstance(t, str) else str(t)
-    return out, texts
+    return out
 
 
 async def handler(job):
     print(f"[handler] job {job.get('id')} received", flush=True)
-    inputs = job.get("input") or {}
-    if inputs.get("action") == "health":
+    job_input = job.get("input") or {}
+    if job_input.get("action") == "health":
         # Hub smoke test: answers 200 without touching ComfyUI or models, so it
         # also works on an endpoint deployed without the network volume.
         return {
             "status": "ok",
             "comfyui": "failed" if _BOOT_ERR else ("ready" if _BOOT_DONE.is_set() else "booting"),
             "comfyui_error": str(_BOOT_ERR) if _BOOT_ERR else None,
-            "workflows": sorted({p.name for d in (WF_SYNC_DIR, WORKFLOWS_DIR) for p in d.glob("*.json")}),
-            "volume_mounted": os.path.isdir("/runpod-volume"),
+            "workflows": _workflow_names(),
+            "manifests": sorted(p.stem for p in MANIFESTS_DIR.glob("*.txt")),
+            "volume_mounted": VOL_ROOT.is_dir(),
         }
-    # Any real workload needs ComfyUI — wait for the background boot first.
-    await _ensure_comfy()
-    _prune_volume_outputs()
-    # _patch uploads input media (blocking, up to minutes for video) — run it
-    # off-thread so a cancel signal can still be delivered during uploads.
-    if isinstance(inputs.get("prompt_graph"), dict):
-        # Raw API-format graph shipped inside the job (ForgeHub mode): the same
-        # _patch applies — media upload, config preset, unet/lora needle, prompt.
-        prompt = await asyncio.to_thread(_patch, inputs["prompt_graph"], inputs)
-    else:
-        wf = _load_workflow(inputs.get("workflow") or "")
-        prompt = await asyncio.to_thread(_patch, wf, inputs)
-    prompt = _apply_node_params(prompt, inputs.get("params"))
+
+    try:
+        provisioned = None
+        if job_input.get("models_manifest"):
+            provisioned = await asyncio.to_thread(_provision_models, job_input["models_manifest"])
+            if job_input.get("models_only"):
+                return {"provisioned": provisioned}
+        elif job_input.get("models_only"):
+            raise JobError("models_only requires models_manifest")
+
+        prompt = _load_workflow(job_input.get("workflow") or "")
+        await _ensure_comfy()
+        _prune_volume_outputs()
+        # Uploads block (network) — run off-thread so a cancel can still land.
+        warnings, seed = await asyncio.to_thread(
+            apply_inputs, prompt, job_input.get("inputs") or {}, _upload, str(job.get("id") or "job"))
+        _check_models_present(prompt)
+    except JobError as exc:
+        return {"error": str(exc)}
+
+    for w in warnings:
+        print(f"[handler] warning: {w}", flush=True)
     print(f"[handler] queuing prompt ({len(prompt)} nodes)", flush=True)
     started = time.time()
-    comfy_log = Path("/workspace/comfy.log")
-    log_mark = comfy_log.stat().st_size if comfy_log.is_file() else 0
     history = await _queue_and_wait(prompt)
     print(f"[handler] comfy execution took {time.time() - started:.1f}s", flush=True)
     inline_used = [0]
-    outputs, texts = await asyncio.to_thread(_collect_outputs, history, prompt, job, inline_used)
-    try:  # surface ComfyUI warnings/errors from this job in the worker log
-        with open(comfy_log, "rb") as f:
-            f.seek(log_mark)
-            interesting = [l for l in f.read().decode(errors="replace").splitlines()
-                           if re.search(r"warn|error|missing|unexpected|fail|dtype|clip|traceback", l, re.I)]
-            for l in interesting[-40:]:
-                print(f"[comfy] {l}", flush=True)
-    except Exception:
-        pass
+    outputs = await asyncio.to_thread(_collect_outputs, history, job, inline_used)
     if not outputs:
         outputs = _collect_new_files(started, job, inline_used)
         print(f"[handler] fallback sweep — {len(outputs)} file(s) in output/", flush=True)
     print(f"[handler] done — {len(outputs)} output(s)", flush=True)
-    return {"outputs": outputs, "texts": texts}
+    result = {"outputs": outputs, "seed": seed, "warnings": warnings}
+    if provisioned is not None:
+        result["provisioned"] = provisioned
+    return result
 
 
 if __name__ == "__main__":
+    import runpod
     threading.Thread(target=_boot_in_bg, daemon=True).start()
     runpod.serverless.start({"handler": handler})

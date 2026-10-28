@@ -31,7 +31,7 @@
         "input": {
           "name": "Hugging Face token",
           "type": "string",
-          "description": "Optional — only needed if you edit models-manifest.txt to pull from gated Hugging Face repos. All bundled models are public.",
+          "description": "Optional — only needed if you edit models/*.txt to pull from gated Hugging Face repos. All bundled models are public.",
           "default": "",
           "advanced": true
         }

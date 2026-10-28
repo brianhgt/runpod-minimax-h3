@@ -1,0 +1,21 @@
+{
+  "endpointId": "vj5rjg70ppdbky",
+  "outputDir": "D:/workspace/imagegen/_ns/_output/runpod/h3_video",
+  "timeoutMinutes": 30,
+  "input": {
+    "workflow": "video_minimax_h3_r2v",
+    "models_manifest": "ref2va",
+    "inputs": {
+      "Input Text (Prompt)": "A slow, subtle camera arc around the subject, maintaining consistent anatomy, texture and lighting.",
+      "INPUT - Frame Count": 121,
+      "Resolution Selector (Size)": {
+        "aspect_ratio": "9:16 (Portrait Widescreen)",
+        "megapixels": 0.4
+      },
+      "Seed": -1,
+      "Reference Image": [
+        "@D:/workspace/imagegen/_ns/Photos-nsfw-002/20260411_224425.jpg"
+      ]
+    }
+  }
+}

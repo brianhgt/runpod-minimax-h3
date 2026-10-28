@@ -3,7 +3,7 @@
 # - Comfy-Org INT8 ConvRot DiTs + Qwen3-VL-32B Heretic NVFP4 TE + lightx2v
 #   turbo LoRAs, loaded from the network volume (~100GB, needs a 48GB+ GPU)
 # - Missing volume files are auto-downloaded at worker boot from
-#   models-manifest.txt (populate-volume.sh, VOLUME_AUTOPOPULATE=false to skip)
+#   models/all.txt (populate-volume.sh, VOLUME_AUTOPOPULATE=false to skip)
 # - runpod serverless handler drives ComfyUI per-job (handler.py)
 #
 
@@ -62,12 +62,22 @@ ENV HF_TOKEN=""
 # ──────────────────────────────────────────────────────────────────────────────
 # Serverless entrypoint + handler + workflow templates (API format)
 # ──────────────────────────────────────────────────────────────────────────────
-COPY handler.py /opt/serverless/handler.py
+COPY handler.py manifest_tools.py /opt/serverless/
 COPY serverless-entrypoint.sh /opt/serverless/entrypoint.sh
 COPY populate-volume.sh /opt/serverless/populate-volume.sh
-COPY models-manifest.txt /opt/serverless/models-manifest.txt
-COPY workflows-api/mmh3/ /opt/workflows/
+COPY models/ /opt/serverless/models/
+COPY workflows-api/h3/ /opt/workflows/
 RUN chmod +x /opt/serverless/entrypoint.sh /opt/serverless/populate-volume.sh
+
+# Build-time validation: manifests well-formed, every URL resolves with the
+# expected size, and every model a workflow loads is listed in a manifest.
+# (Real byte/sha256 checks run on the volume at populate time — ~100GB of
+# models can't be downloaded during the image build.)
+# Offline builds: --build-arg SKIP_NET_VALIDATION=1
+ARG SKIP_NET_VALIDATION=0
+RUN python3 /opt/serverless/manifest_tools.py workflows /opt/workflows /opt/serverless/models/all.txt && \
+    if [ "$SKIP_NET_VALIDATION" = "1" ]; then NET=--no-network; else NET=; fi && \
+    python3 /opt/serverless/manifest_tools.py static $NET /opt/serverless/models/*.txt
 
 ENV COMFYUI_DIR="/workspace/runpod-slim/ComfyUI" \
     WORKFLOWS_DIR="/opt/workflows" \
