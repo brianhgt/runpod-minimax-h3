@@ -1,7 +1,7 @@
 {
   "endpointId": "bwo7h00snwy95g",
   "outputDir": "D:/workspace/imagegen/_ns/_output/runpod/h3_video",
-  "timeoutMinutes": 30,
+  "timeoutMinutes": 90,
   "input": {
     "workflow": "video_minimax_h3_r2v",
     "models_manifest": "ref2va",
@@ -10,7 +10,7 @@
       "INPUT - Frame Count": 121,
       "Resolution Selector (Size)": {
         "aspect_ratio": "9:16 (Portrait Widescreen)",
-        "megapixels": 0.4
+        "megapixels": 0.2
       },
       "Seed": -1,
       "Reference Image": [

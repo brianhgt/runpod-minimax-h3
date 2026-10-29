@@ -117,7 +117,7 @@ $Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 $Result = $null
 while ((Get-Date) -lt $Deadline) {
     Start-Sleep -Seconds 5
-    $Result = Invoke-RestMethod -Method Get -Uri $StatusUrl -Headers $Headers -TimeoutSec 60
+    $Result = Invoke-RestMethod -Method Get -Uri $StatusUrl -Headers $Headers -TimeoutSec 120
     Write-Host "$(Get-Date -Format 'HH:mm:ss')  Status: $($Result.status)"
     if ($Result.status -eq "COMPLETED") { break }
     if ($Result.status -in @("FAILED", "CANCELLED", "TIMED_OUT")) {
@@ -141,21 +141,68 @@ if ($Result.output.provisioned) {
 }
 
 # ---- Save outputs ----
+function Get-NextOutputPath([string]$Directory, [string]$FileName) {
+    $Extension = [System.IO.Path]::GetExtension($FileName)
+    $Stem = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+    if ($Stem -match '^(?<prefix>.+)_(?<number>\d+)_?$') {
+        $Prefix = $Matches.prefix
+        $Number = [int]$Matches.number
+        $Width = $Matches.number.Length
+        while ($true) {
+            $Suffix = $Number.ToString("D$Width")
+            $Candidate = Join-Path $Directory "$Prefix`_$Suffix$Extension"
+            $LegacyCandidate = Join-Path $Directory "$Prefix`_$($Suffix)_$Extension"
+            if (-not (Test-Path -LiteralPath $Candidate) -and -not (Test-Path -LiteralPath $LegacyCandidate)) {
+                return $Candidate
+            }
+            $Number++
+        }
+    }
+
+    $Candidate = Join-Path $Directory $FileName
+    if (-not (Test-Path -LiteralPath $Candidate)) { return $Candidate }
+    $Number = 2
+    do {
+        $Candidate = Join-Path $Directory ("{0}_{1:D5}{2}" -f $Stem, $Number, $Extension)
+        $Number++
+    } while (Test-Path -LiteralPath $Candidate)
+    return $Candidate
+}
+
+New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 foreach ($Output in @($Result.output.outputs)) {
     if (-not $Output) { continue }
     $FileName = [System.IO.Path]::GetFileName([string]$Output.filename)
     if (-not $FileName) { $FileName = "output.bin" }
-    $Destination = Join-Path $OutputDir $FileName
+    $TempPath = Join-Path $OutputDir (".{0}.{1}.tmp" -f $FileName, [guid]::NewGuid().ToString("N"))
 
-    if ($Output.url) {
-        Invoke-WebRequest -Uri $Output.url -OutFile $Destination -TimeoutSec 600
+    try {
+        if ($Output.url) {
+            Invoke-WebRequest -Uri $Output.url -OutFile $TempPath -TimeoutSec 1600
+        }
+        elseif ($Output.b64) {
+            [System.IO.File]::WriteAllBytes($TempPath, [Convert]::FromBase64String([string]$Output.b64))
+        }
+        else {
+            Write-Warning "No URL or Base64 payload for output: $FileName"
+            continue
+        }
+
+        while ($true) {
+            $Destination = Get-NextOutputPath -Directory $OutputDir -FileName $FileName
+            try {
+                [System.IO.File]::Move($TempPath, $Destination)
+                break
+            }
+            catch [System.IO.IOException] {
+                if (-not (Test-Path -LiteralPath $Destination)) { throw }
+            }
+        }
     }
-    elseif ($Output.b64) {
-        [System.IO.File]::WriteAllBytes($Destination, [Convert]::FromBase64String([string]$Output.b64))
-    }
-    else {
-        Write-Warning "No URL or Base64 payload for output: $FileName"
-        continue
+    finally {
+        if (Test-Path -LiteralPath $TempPath) {
+            Remove-Item -LiteralPath $TempPath
+        }
     }
     Write-Host "Saved: $Destination"
 }

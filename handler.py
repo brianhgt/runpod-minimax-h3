@@ -87,6 +87,14 @@ def _http(path, payload=None, timeout=30):
         raise RuntimeError(f"ComfyUI {path} → HTTP {e.code}: {body}") from e
 
 
+def _tee_comfy_output(pipe, log_path):
+    with open(log_path, "a", encoding="utf-8", errors="replace", buffering=1) as log:
+        for line in iter(pipe.readline, ""):
+            log.write(line)
+            print(f"[comfyui] {line}", end="" if line.endswith("\n") else "\n", flush=True)
+    pipe.close()
+
+
 _BOOT_DONE = threading.Event()
 _BOOT_ERR = None
 
@@ -103,12 +111,16 @@ def _boot_comfy():
         "--extra-model-paths-config",
         str(Path(COMFY_DIR) / "extra_model_paths.yaml"),
     ] + os.environ.get("COMFYUI_EXTRA_ARGS", "").split()
-    comfy_log = open("/workspace/comfy.log", "ab", buffering=0)
-    proc = subprocess.Popen(cmd, cwd=COMFY_DIR, stdout=comfy_log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(
+        cmd, cwd=COMFY_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1)
+    threading.Thread(
+        target=_tee_comfy_output, args=(proc.stdout, "/workspace/comfy.log"), daemon=True,
+    ).start()
     deadline = time.time() + 600
     while time.time() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError("ComfyUI exited during boot")
+            raise RuntimeError(f"ComfyUI exited during boot with code {proc.returncode}")
         try:
             _http("/system_stats", timeout=5)
             return proc
