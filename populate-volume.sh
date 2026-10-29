@@ -46,7 +46,7 @@ echo "populate: free space on $VOL_ROOT: $(df -h "$VOL_ROOT" | awk 'NR==2{print 
 mkdir -p "$M"
 
 verify() { # verify <subdir/name> [--hash]
-    python3 "$TOOLS" verify "$M" "${MANIFESTS[@]}" --entry "$1" ${2:+"$2"} >/dev/null 2>&1
+    python3 "$TOOLS" verify "$M" "${MANIFESTS[@]}" --entry "$1" ${2:+"$2"} >/dev/null
 }
 
 download() { # download <sub> <name> <url> <dest>
@@ -61,9 +61,11 @@ download() { # download <sub> <name> <url> <dest>
         rm -rf "$tmp_dir"; mkdir -p "$tmp_dir"
         export HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_XET=1
         if hf download "$repo_id" "$repo_path" --local-dir "$tmp_dir" && [ -f "$tmp_dir/$repo_path" ]; then
-            mv -f "$tmp_dir/$repo_path" "$dest"
-            rm -rf "$tmp_dir"
-            return 0
+            if mv -f "$tmp_dir/$repo_path" "$dest"; then
+                rm -rf "$tmp_dir"
+                return 0
+            fi
+            echo "populate: failed to move downloaded file into place: $dest" >&2
         fi
         rm -rf "$tmp_dir"
     fi
