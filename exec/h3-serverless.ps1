@@ -108,7 +108,8 @@ if (-not $Job.id) {
     throw "RunPod did not return a job ID."
 }
 $JobId = $Job.id
-Write-Host "Job ID: $JobId  Status: $($Job.status)"
+Write-Host "Job ID: $JobId"
+Write-Host "Initial Status: $($Job.status)"
 
 # ---- Poll ----
 $StatusUrl = "https://api.runpod.ai/v2/$EndpointId/status/$JobId"
