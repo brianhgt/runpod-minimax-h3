@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Serverless worker entrypoint: materialize baked ComfyUI, point it at the
 # network volume for models, then hand off to the runpod handler.
 set -e

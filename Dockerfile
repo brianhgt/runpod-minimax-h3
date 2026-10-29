@@ -59,6 +59,10 @@ RUN mkdir -p /opt/comfyui-baked/models/{vae,vae_approx,diffusion_models,unet,tex
 
 ENV HF_TOKEN=""
 
+RUN apt-get update && apt-get install -y --no-install-recommends bash \
+  && rm -rf /var/lib/apt/lists/*
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Serverless entrypoint + handler + workflow templates (API format)
 # ──────────────────────────────────────────────────────────────────────────────
