@@ -52,14 +52,13 @@ verify() { # verify <subdir/name> [--hash]
 download() { # download <sub> <name> <url> <dest>
     local sub="$1" name="$2" url="$3" dest="$4"
     if command -v hf >/dev/null 2>&1 && [[ "$url" =~ ^https://huggingface\.co/ ]]; then
-        # Plain hf_transfer HTTP path â€” xet stages chunks on the container
-        # disk (30GB cap) and dies with EDQUOT on multi-GB files.
+        # Disable Xet: its chunk cache can exceed the container's disk cap.
         local repo_id repo_path tmp_dir
         repo_id=$(echo "$url" | awk -F/ '{print $4"/"$5}')
         repo_path=$(echo "$url" | sed -E 's#https?://[^/]+/[^/]+/[^/]+/resolve/[^/]+/(.+)#\1#')
         tmp_dir="$M/$sub/.tmp_hf_$name"
         rm -rf "$tmp_dir"; mkdir -p "$tmp_dir"
-        export HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_XET=1
+        export HF_HUB_DISABLE_XET=1
         if hf download "$repo_id" "$repo_path" --local-dir "$tmp_dir" && [ -f "$tmp_dir/$repo_path" ]; then
             if mv -f "$tmp_dir/$repo_path" "$dest"; then
                 rm -rf "$tmp_dir"

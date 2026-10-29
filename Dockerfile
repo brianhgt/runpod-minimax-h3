@@ -48,7 +48,9 @@ RUN bash -c 'cd /opt/comfyui-baked/custom_nodes && for node_dir in */; do \
         fi; \
     done' && \
     pip install --no-cache-dir --no-deps "transformers>=5.2.0" && \
-    pip install --no-cache-dir 'runpod>=1.12' requests boto3 "huggingface_hub[cli]" hf_transfer && \
+    pip install --no-cache-dir 'runpod>=1.12' requests boto3 "huggingface_hub[cli]" && \
+    pip install --no-cache-dir --upgrade "huggingface_hub[cli]" && \
+    hf version && \
     pip cache purge
 
 # ──────────────────────────────────────────────────────────────────────────────
