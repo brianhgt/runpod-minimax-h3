@@ -67,7 +67,8 @@ COPY serverless-entrypoint.sh /opt/serverless/entrypoint.sh
 COPY populate-volume.sh /opt/serverless/populate-volume.sh
 COPY models/ /opt/serverless/models/
 COPY workflows-api/h3/ /opt/workflows/
-RUN chmod +x /opt/serverless/entrypoint.sh /opt/serverless/populate-volume.sh
+RUN sed -i 's/\r$//' /opt/serverless/entrypoint.sh /opt/serverless/populate-volume.sh && \
+    chmod +x /opt/serverless/entrypoint.sh /opt/serverless/populate-volume.sh
 
 # Build-time validation: manifests well-formed, every URL resolves with the
 # expected size, and every model a workflow loads is listed in a manifest.
@@ -87,4 +88,4 @@ ENV COMFYUI_DIR="/workspace/runpod-slim/ComfyUI" \
 # Base image carries ENTRYPOINT ["/start.sh"] (pod mode) — a bare CMD would be
 # passed to it as args and the runpod handler would never start. Override the
 # entrypoint so the container runs the serverless handler directly.
-ENTRYPOINT ["/opt/serverless/entrypoint.sh"]
+ENTRYPOINT ["/bin/bash", "/opt/serverless/entrypoint.sh"]

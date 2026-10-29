@@ -3,6 +3,17 @@
 # network volume for models, then hand off to the runpod handler.
 set -e
 
+echo "[entrypoint] starting serverless handler"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[entrypoint] python3 not found in PATH: $PATH" >&2
+    exit 127
+fi
+if [ ! -f /opt/serverless/handler.py ]; then
+    echo "[entrypoint] missing handler: /opt/serverless/handler.py" >&2
+    exit 1
+fi
+
 COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
 BAKED="/opt/comfyui-baked"
 VENV_DIR="$COMFYUI_DIR/.venv-${VENV_SUFFIX:-cu130}"
